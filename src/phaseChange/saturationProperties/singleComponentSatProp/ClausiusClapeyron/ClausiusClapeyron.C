@@ -3,7 +3,7 @@
 -------------------------------------------------------------------------------
 License
     This file is part of the VoFLibrary source code library, which is an
-	unofficial extension to OpenFOAM.
+    unofficial extension to OpenFOAM.
     OpenFOAM is free software: you can redistribute it and/or modify it
     under the terms of the GNU General Public License as published by
     the Free Software Foundation, either version 3 of the License, or
@@ -17,20 +17,15 @@ License
 
 \*---------------------------------------------------------------------------*/
 
-//#include "physicoChemicaClausiusClapeyrons.H"
 #include "ClausiusClapeyron.H"
 #include "addToRunTimeSelectionTable.H"
 #include "zeroGradientFvPatchFields.H"
-
-// * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
 
 namespace Foam
 {
     defineTypeNameAndDebug(ClausiusClapeyron, 0);
     addToRunTimeSelectionTable(singleComponentSatProp,ClausiusClapeyron, components);
 }
-
-// * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
 Foam::ClausiusClapeyron::ClausiusClapeyron
 (
@@ -51,46 +46,27 @@ Foam::ClausiusClapeyron::ClausiusClapeyron
 {
 }
 
-// * * * * * * * * * * * * * * Public Access Member Functions  * * * * * * * * * * * * * * //
-
-// * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
-
-// bool Foam::ClausiusClapeyron::read()
-// {
-//     if (singleComponentSatProp::read())
-//     {
-//         modelDict().lookup("Tmin") >> Tmin_;
-//         modelDict().lookup("Tmax") >> Tmax_;
-
-//         modelDict().lookup("pSat0") >> pSat0_;
-//         modelDict().lookup("TSat0") >> TSat0_;
-//         modelDict().lookup("L0") >> L0_;
-//         modelDict().lookup("M") >> M_;
-
-//         return true;
-//     }
-//     return false;
-// }
-
 Foam::scalar
 Foam::ClausiusClapeyron::C0()
 {
-    scalar c0 = L0_/(R_*TSat0_) + log(pSat0_);
-    return c0;
+    // ln(p) = C0 - L/(R T)
+    return L0_/(R_*TSat0_) + log(pSat0_);
 }
 
 Foam::scalar
 Foam::ClausiusClapeyron::satT(scalar p) const
 {
-    scalar tsati = L0_/(R_ * (Foam::log(p) - C0_));
-    return tsati;
+    // Invert ln(p) = C0 - L/(R T):
+    // T = L / (R (C0 - ln(p))).
+    // The previous implementation used ln(p)-C0 and therefore returned a
+    // negative saturation temperature for physically valid inputs.
+    return L0_/(R_ * (C0_ - Foam::log(p)));
 }
 
 Foam::scalar
 Foam::ClausiusClapeyron::satP(Foam::scalar T) const
 {
-    scalar psati =     Foam::exp(C0_ - L0_/(R_*T));
-    return psati;
+    return Foam::exp(C0_ - L0_/(R_*T));
 }
 
 Foam::scalar
