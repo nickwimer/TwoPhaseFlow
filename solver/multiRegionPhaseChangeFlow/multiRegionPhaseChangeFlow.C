@@ -61,6 +61,10 @@ Description
 
 #include "singleComponentPhaseChange.H"
 
+#include "UPstream.H"
+
+#include <cstdlib>
+
 
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
@@ -143,6 +147,13 @@ int main(int argc, char *argv[])
     }
 
     Info<< "End\n" << endl;
+
+    if (Pstream::parRun())
+    {
+        Info<< "Normal parallel shutdown before static library teardown" << endl;
+        UPstream::shutdown(0);
+        std::_Exit(0);
+    }
 
     return 0;
 }
