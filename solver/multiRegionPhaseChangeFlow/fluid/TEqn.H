@@ -107,6 +107,92 @@
         }
     }
 
+    const Switch abortOnTemperatureBounding
+    (
+        pimple.lookupOrDefault<Switch>
+        (
+            "abortOnTemperatureBounding",
+            false
+        )
+    );
+    const Switch abortOnTemperatureLimitContact
+    (
+        pimple.lookupOrDefault<Switch>
+        (
+            "abortOnTemperatureLimitContact",
+            false
+        )
+    );
+    const scalar temperatureBoundingTolerance =
+        pimple.lookupOrDefault<scalar>
+        (
+            "temperatureBoundingTolerance",
+            1e-8
+        );
+
+    label preTLBelow = 0;
+    label preTLAbove = 0;
+    label preTVBelow = 0;
+    label preTVAbove = 0;
+    label preTLAtLimit = 0;
+    label preTVAtLimit = 0;
+    forAll(TL, cellI)
+    {
+        preTLBelow +=
+            TL[cellI] < TMin.value() - temperatureBoundingTolerance;
+        preTLAbove +=
+            TL[cellI] > TMax.value() + temperatureBoundingTolerance;
+        preTVBelow +=
+            TV[cellI] < TMin.value() - temperatureBoundingTolerance;
+        preTVAbove +=
+            TV[cellI] > TMax.value() + temperatureBoundingTolerance;
+        preTLAtLimit +=
+            TL[cellI] <= TMin.value() + temperatureBoundingTolerance
+         || TL[cellI] >= TMax.value() - temperatureBoundingTolerance;
+        preTVAtLimit +=
+            TV[cellI] <= TMin.value() + temperatureBoundingTolerance
+         || TV[cellI] >= TMax.value() - temperatureBoundingTolerance;
+    }
+    reduce(preTLBelow, sumOp<label>());
+    reduce(preTLAbove, sumOp<label>());
+    reduce(preTVBelow, sumOp<label>());
+    reduce(preTVAbove, sumOp<label>());
+    reduce(preTLAtLimit, sumOp<label>());
+    reduce(preTVAtLimit, sumOp<label>());
+
+    Info<< "temperature-bound diagnostics: stage=preSolve"
+        << ", TLBelow=" << preTLBelow
+        << ", TLAbove=" << preTLAbove
+        << ", TVBelow=" << preTVBelow
+        << ", TVAbove=" << preTVAbove
+        << ", TLAtLimit=" << preTLAtLimit
+        << ", TVAtLimit=" << preTVAtLimit << endl;
+
+    if
+    (
+        abortOnTemperatureBounding
+     && (preTLBelow + preTLAbove + preTVBelow + preTVAbove) > 0
+    )
+    {
+        FatalErrorInFunction
+            << "Temperature bounding would be applied before the energy solve. "
+            << "TLBelow=" << preTLBelow << ", TLAbove=" << preTLAbove
+            << ", TVBelow=" << preTVBelow << ", TVAbove=" << preTVAbove
+            << exit(FatalError);
+    }
+    if
+    (
+        abortOnTemperatureLimitContact
+     && (preTLAtLimit + preTVAtLimit) > 0
+    )
+    {
+        FatalErrorInFunction
+            << "A phase temperature reached a configured numerical limit "
+            << "before the energy solve. TLAtLimit=" << preTLAtLimit
+            << ", TVAtLimit=" << preTVAtLimit
+            << exit(FatalError);
+    }
+
     TL = max(min(TL,TMax),TMin);
     TV = max(min(TV,TMax),TMin);
 
@@ -124,6 +210,69 @@
 
     Info << "min(TL) " << gMin(TL) << "  max(TL) " << gMax(TL)  << endl;
     Info << "min(TV) " << gMin(TV) << "  max(TV) " << gMax(TV) << endl;
+
+    label postTLBelow = 0;
+    label postTLAbove = 0;
+    label postTVBelow = 0;
+    label postTVAbove = 0;
+    label postTLAtLimit = 0;
+    label postTVAtLimit = 0;
+    forAll(TL, cellI)
+    {
+        postTLBelow +=
+            TL[cellI] < TMin.value() - temperatureBoundingTolerance;
+        postTLAbove +=
+            TL[cellI] > TMax.value() + temperatureBoundingTolerance;
+        postTVBelow +=
+            TV[cellI] < TMin.value() - temperatureBoundingTolerance;
+        postTVAbove +=
+            TV[cellI] > TMax.value() + temperatureBoundingTolerance;
+        postTLAtLimit +=
+            TL[cellI] <= TMin.value() + temperatureBoundingTolerance
+         || TL[cellI] >= TMax.value() - temperatureBoundingTolerance;
+        postTVAtLimit +=
+            TV[cellI] <= TMin.value() + temperatureBoundingTolerance
+         || TV[cellI] >= TMax.value() - temperatureBoundingTolerance;
+    }
+    reduce(postTLBelow, sumOp<label>());
+    reduce(postTLAbove, sumOp<label>());
+    reduce(postTVBelow, sumOp<label>());
+    reduce(postTVAbove, sumOp<label>());
+    reduce(postTLAtLimit, sumOp<label>());
+    reduce(postTVAtLimit, sumOp<label>());
+
+    Info<< "temperature-bound diagnostics: stage=postSolve"
+        << ", TLBelow=" << postTLBelow
+        << ", TLAbove=" << postTLAbove
+        << ", TVBelow=" << postTVBelow
+        << ", TVAbove=" << postTVAbove
+        << ", TLAtLimit=" << postTLAtLimit
+        << ", TVAtLimit=" << postTVAtLimit << endl;
+
+    if
+    (
+        abortOnTemperatureBounding
+     && (postTLBelow + postTLAbove + postTVBelow + postTVAbove) > 0
+    )
+    {
+        FatalErrorInFunction
+            << "Temperature bounding would be applied after the energy solve. "
+            << "TLBelow=" << postTLBelow << ", TLAbove=" << postTLAbove
+            << ", TVBelow=" << postTVBelow << ", TVAbove=" << postTVAbove
+            << exit(FatalError);
+    }
+    if
+    (
+        abortOnTemperatureLimitContact
+     && (postTLAtLimit + postTVAtLimit) > 0
+    )
+    {
+        FatalErrorInFunction
+            << "A phase temperature reached a configured numerical limit "
+            << "after the energy solve. TLAtLimit=" << postTLAtLimit
+            << ", TVAtLimit=" << postTVAtLimit
+            << exit(FatalError);
+    }
 
     TL = max(min(TL,TMax),TMin);
     TV = max(min(TV,TMax),TMin);

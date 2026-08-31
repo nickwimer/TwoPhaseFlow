@@ -93,6 +93,12 @@ class singleComponentPhaseChange
 
     bool limitHeatFlux_;
 
+    Switch writeSourceDiagnostics_;
+
+    label sourceDiagnosticsInterval_;
+
+    label lastSourceDiagnosticsTimeIndex_;
+
 
 public:
 

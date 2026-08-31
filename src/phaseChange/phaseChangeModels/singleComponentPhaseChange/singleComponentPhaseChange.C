@@ -96,13 +96,16 @@ Foam::singleComponentPhaseChange::singleComponentPhaseChange
         mesh_.time().timeName(),
         mesh_,
         IOobject::NO_READ,
-        IOobject::NO_WRITE
+        IOobject::AUTO_WRITE
     ),
         mesh_,
         dimensionedScalar("0", dimless/dimTime, 0),
         "zeroGradient"
     ),
-    limitHeatFlux_(false)
+    limitHeatFlux_(false),
+    writeSourceDiagnostics_(true),
+    sourceDiagnosticsInterval_(1),
+    lastSourceDiagnosticsTimeIndex_(-1)
 {
     IOdictionary phaseChangeProperties
     (
@@ -116,9 +119,36 @@ Foam::singleComponentPhaseChange::singleComponentPhaseChange
         )
     );
 
+    limitHeatFlux_ = phaseChangeProperties.lookupOrDefault<Switch>
+    (
+        "limitHeatFlux",
+        false
+    );
+    writeSourceDiagnostics_ = phaseChangeProperties.lookupOrDefault<Switch>
+    (
+        "writeSourceDiagnostics",
+        true
+    );
+    sourceDiagnosticsInterval_ = phaseChangeProperties.lookupOrDefault<label>
+    (
+        "sourceDiagnosticsInterval",
+        1
+    );
+    if (sourceDiagnosticsInterval_ < 1)
+    {
+        FatalErrorInFunction
+            << "sourceDiagnosticsInterval must be >= 1; found "
+            << sourceDiagnosticsInterval_ << exit(FatalError);
+    }
+
     dictionary satPropertiesDict =
         phaseChangeProperties.subDict("satProperties");
     Info << "creating models" << endl;
+    Info << "phase-change heat-flux/phase-availability limiting: "
+         << limitHeatFlux_ << endl;
+    Info << "phase-change compact source diagnostics: "
+         << writeSourceDiagnostics_
+         << ", interval=" << sourceDiagnosticsInterval_ << endl;
 
     Info << "creating singleComponentSatProp Model" << endl;
     satProp_ =  singleComponentSatProp::New(mesh_,satPropertiesDict);
@@ -241,7 +271,35 @@ void Foam::singleComponentPhaseChange::correct()
         mModel.alphaSource(alphaSource_);
     }
 
+    const label timeIndex = mesh_.time().timeIndex();
+    const bool diagnosticsDue =
+        writeSourceDiagnostics_
+     && timeIndex != lastSourceDiagnosticsTimeIndex_
+     &&
+        (
+            timeIndex % sourceDiagnosticsInterval_ == 0
+         || mesh_.time().writeTime()
+        );
+    if (diagnosticsDue)
+    {
+        lastSourceDiagnosticsTimeIndex_ = timeIndex;
+        const dimensionedScalar integratedPsi0 =
+            fvc::domainIntegrate(psi0_);
+        const dimensionedScalar integratedMassSource =
+            fvc::domainIntegrate(massSource_);
+        const dimensionedScalar integratedAlphaSource =
+            fvc::domainIntegrate(alphaSource_);
 
+        Info<< "phase-change source diagnostics: integratedPsi0="
+            << integratedPsi0.value()
+            << ", integratedMassSource=" << integratedMassSource.value()
+            << ", integratedAlphaSource=" << integratedAlphaSource.value()
+            << ", minMassSource=" << gMin(massSource_)
+            << ", maxMassSource=" << gMax(massSource_)
+            << ", minAlphaSource=" << gMin(alphaSource_)
+            << ", maxAlphaSource=" << gMax(alphaSource_)
+            << endl;
+    }
 }
 
 void Foam::singleComponentPhaseChange::correctSatProperties

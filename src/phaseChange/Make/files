@@ -16,6 +16,7 @@ phaseChangeModels/massSourceTermModel/noPhaseChange/noPhaseChange.C
 phaseChangeModels/macroModels/macroModel.C
 phaseChangeModels/macroModels/macroModels.C
 phaseChangeModels/macroModels/directEvaporation/directEvaporation.C
+phaseChangeModels/macroModels/wallSuperheatVaporBirth/wallSuperheatVaporBirth.C
 
 phaseChangeModels/singleComponentPhaseChange/singleComponentPhaseChange.C
 
