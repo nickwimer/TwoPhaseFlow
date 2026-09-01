@@ -17,6 +17,7 @@ phaseChangeModels/macroModels/macroModel.C
 phaseChangeModels/macroModels/macroModels.C
 phaseChangeModels/macroModels/directEvaporation/directEvaporation.C
 phaseChangeModels/macroModels/wallSuperheatVaporBirth/wallSuperheatVaporBirth.C
+phaseChangeModels/macroModels/distributedSurfaceTopologyBirth/distributedSurfaceTopologyBirth.C
 
 phaseChangeModels/singleComponentPhaseChange/singleComponentPhaseChange.C
 
