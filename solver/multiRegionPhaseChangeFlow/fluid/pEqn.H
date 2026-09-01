@@ -15,6 +15,12 @@
     // Defaults preserve the production equations exactly. These are not
     // physical model switches and must remain at 1 outside verification.
     const dictionary& verificationControlDict = mesh.time().controlDict();
+    const Switch capillaryVerificationEnabled =
+        verificationControlDict.lookupOrDefault<Switch>
+        (
+            "capillaryVerificationEnabled",
+            false
+        );
     const scalar capillaryVerificationVaporDensityTransportScale =
         verificationControlDict.lookupOrDefault<scalar>
         (
@@ -33,23 +39,31 @@
             "capillaryVerificationVaporDensityUpdateScale",
             1.0
         );
+    const scalar capillaryVerificationDgdtScale =
+        verificationControlDict.lookupOrDefault<scalar>
+        (
+            "capillaryVerificationDgdtScale",
+            1.0
+        );
 
     if
     (
         capillaryVerificationVaporDensityTransportScale < 0
      || capillaryVerificationVaporPressureDdtScale < 0
      || capillaryVerificationVaporDensityUpdateScale < 0
+     || capillaryVerificationDgdtScale < 0
     )
     {
         FatalErrorInFunction
-            << "Case-202 vapor-coupling verification scales must be >= 0: "
+            << "Case-202 verification scales must be >= 0: "
             << capillaryVerificationVaporDensityTransportScale << ' '
             << capillaryVerificationVaporPressureDdtScale << ' '
-            << capillaryVerificationVaporDensityUpdateScale
+            << capillaryVerificationVaporDensityUpdateScale << ' '
+            << capillaryVerificationDgdtScale
             << exit(FatalError);
     }
 
-    if (corr == 0)
+    if (capillaryVerificationEnabled && corr == 0)
     {
         Info<< "CAPVFY vapor coupling scales: densityTransport="
             << capillaryVerificationVaporDensityTransportScale
@@ -57,6 +71,7 @@
             << capillaryVerificationVaporPressureDdtScale
             << " densityUpdate="
             << capillaryVerificationVaporDensityUpdateScale
+            << " dgdt=" << capillaryVerificationDgdtScale
             << endl;
     }
 
@@ -165,6 +180,26 @@
                 alpha1*(p_rghEqnComp2 & p_rgh)
               - alpha2*(p_rghEqnComp1 & p_rgh)
             );
+
+            const scalar rawDgdtMin = gMin(dgdt.primitiveField());
+            const scalar rawDgdtMax = gMax(dgdt.primitiveField());
+            const scalar rawDgdtMaxAbs = gMax(mag(dgdt.primitiveField()));
+
+            dgdt *= capillaryVerificationDgdtScale;
+
+            if (capillaryVerificationEnabled)
+            {
+                Info<< "CAPDGDT time " << runTime.value()
+                    << " oCorr " << oCorr
+                    << " corr " << corr
+                    << " scale " << capillaryVerificationDgdtScale
+                    << " rawMin " << rawDgdtMin
+                    << " rawMax " << rawDgdtMax
+                    << " rawMaxAbs " << rawDgdtMaxAbs
+                    << " scaledMaxAbs "
+                    << gMax(mag(dgdt.primitiveField()))
+                    << endl;
+            }
 
             phi = phiHbyA + p_rghEqnIncomp.flux();
 
