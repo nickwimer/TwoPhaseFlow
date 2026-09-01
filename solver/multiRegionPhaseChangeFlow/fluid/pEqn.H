@@ -10,23 +10,25 @@
     );
 
     // Verification-only controls used by Case 202 to isolate the inherited
-    // compressible-VOF pressure coupling. The defaults preserve the production
-    // equations exactly. These are not physical model switches and must remain
-    // at 1 outside controlled verification fixtures.
+    // compressible-VOF pressure coupling. Read them from the top-level
+    // controlDict so their scope is unambiguous in this multi-region solver.
+    // Defaults preserve the production equations exactly. These are not
+    // physical model switches and must remain at 1 outside verification.
+    const dictionary& verificationControlDict = mesh.time().controlDict();
     const scalar capillaryVerificationVaporDensityTransportScale =
-        pimple.lookupOrDefault<scalar>
+        verificationControlDict.lookupOrDefault<scalar>
         (
             "capillaryVerificationVaporDensityTransportScale",
             1.0
         );
     const scalar capillaryVerificationVaporPressureDdtScale =
-        pimple.lookupOrDefault<scalar>
+        verificationControlDict.lookupOrDefault<scalar>
         (
             "capillaryVerificationVaporPressureDdtScale",
             1.0
         );
     const scalar capillaryVerificationVaporDensityUpdateScale =
-        pimple.lookupOrDefault<scalar>
+        verificationControlDict.lookupOrDefault<scalar>
         (
             "capillaryVerificationVaporDensityUpdateScale",
             1.0
@@ -47,16 +49,7 @@
             << exit(FatalError);
     }
 
-    if
-    (
-        corr == 0
-     &&
-        (
-            mag(capillaryVerificationVaporDensityTransportScale - 1.0) > SMALL
-         || mag(capillaryVerificationVaporPressureDdtScale - 1.0) > SMALL
-         || mag(capillaryVerificationVaporDensityUpdateScale - 1.0) > SMALL
-        )
-    )
+    if (corr == 0)
     {
         Info<< "CAPVFY vapor coupling scales: densityTransport="
             << capillaryVerificationVaporDensityTransportScale
