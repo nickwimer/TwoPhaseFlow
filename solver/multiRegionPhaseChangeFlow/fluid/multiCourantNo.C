@@ -80,11 +80,17 @@ Foam::Field<Foam::scalar> Foam::multiCourantNo
     surfaceForces& surfForces
 )
 {
-    const volScalarField& rho1 = mixture.thermo1().rho();
-    const volScalarField& rho2 = mixture.thermo2().rho();
+    // rhoThermo::rho() returns tmp<volScalarField>. Keep the tmp objects alive
+    // for the full use of the references below instead of binding references
+    // directly to temporaries that have already been destroyed.
+    tmp<volScalarField> trho1 = mixture.thermo1().rho();
+    tmp<volScalarField> trho2 = mixture.thermo2().rho();
+    const volScalarField& rho1 = trho1();
+    const volScalarField& rho2 = trho2();
+
     scalarField sumPhi
     (
-    fvc::surfaceSum(mag(phi))().internalField()
+        fvc::surfaceSum(mag(phi))().internalField()
     );
 
     scalar CoNum = 0.5*gMax(sumPhi/mesh.V().field())*runTime.deltaTValue();
