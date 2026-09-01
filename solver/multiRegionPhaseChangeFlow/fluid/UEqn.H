@@ -52,7 +52,7 @@
                      - alpha1.oldTime().primitiveField()
                    )
                )
-            << " maxContErr " << gMax(mag(contErr))
+            << " maxContErr " << gMax(mag(contErr.field()))
             << " maxRhoPhi " << gMax(mag(rhoPhi.primitiveField()))
             << " maxFaceResidual "
             << gMax
