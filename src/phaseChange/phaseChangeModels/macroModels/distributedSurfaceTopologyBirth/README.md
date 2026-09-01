@@ -29,20 +29,56 @@ around each event prevents immediate repeated insertion at the same location.
 Existing vapor on the candidate wall-adjacent cell also suppresses a new event
 through `minimumLiquidFraction`.
 
+If `exclusionRadius` is zero, the footprint scales with the created seed radius
+through `exclusionRadiusFactor`. This is the preferred capability-mode setting
+because it permits denser surface populations as the mesh/seed scale is reduced.
+
 ## Seed handoff
 
 `seedRadiusCells` converts the local wall-adjacent cell volume into a physical
 seed radius. `maximumSeedRadius` may cap that radius. The target is a smoothed
 hemispherical vapor cap centered on the wall face. The alpha source is spread
-over `seedCreationDuration`, capped by `maxAlphaVaporPerStep`, and accompanied
-by liquid mass removal and a latent-energy sink. `thermalReserveFraction > 0`
-optionally limits each cell's source by its instantaneous sensible superheat.
+over `seedCreationDuration` and capped by `maxAlphaVaporPerStep`.
+
+`sourceCouplingMode` controls how that finite alpha topology is coupled:
+
+- `conservative`: retain the original alpha + liquid-mass + latent-energy source
+  path. `thermalReserveFraction > 0` may limit the source by instantaneous
+  sensible superheat. This mode remains available for later conservative-handoff
+  qualification.
+- `topologyOnly`: apply only the finite alpha topology. The model does **not** add
+  its artificial mass source or latent sink. Instead it writes the equivalent
+  mass/latent defect rate fields and accumulates the corresponding mass and
+  energy defects in the `DSTB` diagnostics. Ordinary resolved phase change owns
+  mass/energy transfer after the topology has been created.
+
+The topology-only path is intentionally a quantified capability fallback, not a
+claim of conservation. It exists to avoid the unphysical local energy impulse
+observed when a mesh-resolved cap is forced into existence faster than the heater
+can physically supply its latent energy.
 
 The source automatically falls to zero where the resolved vapor fraction has
 already reached the finite target.
 
+## Diagnostic fields
+
+With diagnostics enabled the model writes:
+
+- `<prefix>Superheat`
+- `<prefix>EligibleMask`
+- `<prefix>ActiveSeedMask`
+- `<prefix>AlphaSource`
+- `<prefix>MassSource`
+- `<prefix>LatentSink`
+- `<prefix>EquivalentMassDefectRate`
+- `<prefix>EquivalentLatentDefectRate`
+
+In `topologyOnly` mode the actual `MassSource` and `LatentSink` fields remain
+zero while the equivalent-defect fields quantify what the conservative seed
+creation would have required.
+
 ## Current qualification boundary
 
-The first implementation is intentionally serial-only. Event ownership,
+The implementation is intentionally serial-only. Event ownership,
 decomposition-independent sampling, state persistence across restart, and
 cross-rank seed construction remain explicit MPI/restart work items.
