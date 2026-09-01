@@ -38,8 +38,10 @@ private:
     scalar maxAlphaVaporPerStep_;
     scalar interfaceWidthCells_;
     scalar thermalReserveFraction_;
+    word sourceCouplingMode_;
 
     scalar exclusionRadius_;
+    scalar exclusionRadiusFactor_;
     scalar cooldownTime_;
 
     label maxBirthsPerStep_;
@@ -50,6 +52,9 @@ private:
 
     label lastUpdateTimeIndex_;
     label nextEventId_;
+
+    scalar cumulativeTopologyMassDefect_;
+    scalar cumulativeTopologyLatentDefect_;
 
     DynamicList<vector> eventCentres_;
     DynamicList<vector> eventNormals_;
@@ -74,6 +79,8 @@ private:
     volScalarField alphaBirthSource_;
     volScalarField massBirthSource_;
     volScalarField latentSink_;
+    volScalarField equivalentMassDefectRate_;
+    volScalarField equivalentLatentDefectRate_;
 
     void validateControls() const;
 
@@ -116,6 +123,8 @@ private:
         scalar& integratedAlphaSource,
         scalar& integratedMassSource,
         scalar& integratedLatentSink,
+        scalar& integratedTopologyMassDefectRate,
+        scalar& integratedTopologyLatentDefectRate,
         scalar& maxAlphaRate
     );
 
