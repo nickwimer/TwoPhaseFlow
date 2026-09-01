@@ -20,6 +20,20 @@
             "capillaryVerificationEnabled",
             false
         );
+    const scalar capillaryVerificationMomentumResidualScale =
+        capillaryVerificationControlDict.lookupOrDefault<scalar>
+        (
+            "capillaryVerificationMomentumResidualScale",
+            1.0
+        );
+
+    if (capillaryVerificationMomentumResidualScale < 0)
+    {
+        FatalErrorInFunction
+            << "capillaryVerificationMomentumResidualScale must be >= 0: "
+            << capillaryVerificationMomentumResidualScale
+            << exit(FatalError);
+    }
 
     surfaceScalarField capillaryFaceForceMomentumDiagnostic
     (
@@ -39,10 +53,38 @@
       - pressureFaceGradientMomentumDiagnostic
     );
 
+    scalar maxBoundaryFaceResidual = 0.0;
+    const surfaceScalarField::Boundary& momentumResidualBoundary =
+        capillaryPressureResidualMomentumDiagnostic.boundaryField();
+    forAll(momentumResidualBoundary, patchi)
+    {
+        forAll(momentumResidualBoundary[patchi], facei)
+        {
+            maxBoundaryFaceResidual = max
+            (
+                maxBoundaryFaceResidual,
+                mag(momentumResidualBoundary[patchi][facei])
+            );
+        }
+    }
+    reduce(maxBoundaryFaceResidual, maxOp<scalar>());
+
+    tmp<volVectorField> tMomentumRhsDiagnostic = fvc::reconstruct
+    (
+        capillaryPressureResidualMomentumDiagnostic*mesh.magSf()
+    );
+    const volVectorField& momentumRhsDiagnostic = tMomentumRhsDiagnostic();
+
+    tmp<volScalarField> tUEqnA = UEqn.A();
+    const volScalarField& UEqnA = tUEqnA();
+    tmp<volVectorField> tUEqnH = UEqn.H();
+    const volVectorField& UEqnH = tUEqnH();
+
     if (capillaryVerificationEnabled)
     {
         Info<< "CAPMOMPRE time " << runTime.value()
             << " oCorr " << oCorr
+            << " scale " << capillaryVerificationMomentumResidualScale
             << " maxAlphaDeltaOld "
             << gMax
                (
@@ -54,7 +96,7 @@
                )
             << " maxContErr " << gMax(mag(contErr.field()))
             << " maxRhoPhi " << gMax(mag(rhoPhi.primitiveField()))
-            << " maxFaceResidual "
+            << " maxFaceResidualInternal "
             << gMax
                (
                    mag
@@ -63,6 +105,12 @@
                       .primitiveField()
                    )
                )
+            << " maxFaceResidualBoundary " << maxBoundaryFaceResidual
+            << " maxMomentumRhs "
+            << gMax(mag(momentumRhsDiagnostic.primitiveField()))
+            << " minA " << gMin(UEqnA.primitiveField())
+            << " maxA " << gMax(UEqnA.primitiveField())
+            << " maxH " << gMax(mag(UEqnH.primitiveField()))
             << " maxU " << gMax(mag(U.primitiveField()))
             << endl;
     }
@@ -117,17 +165,7 @@
         solve
         (
             UEqn
-         ==
-            fvc::reconstruct
-            (
-                (
-                    //  mixture.surfaceTensionForce()
-                    surfForces.surfaceTensionForce()
-                    //- ghf*fvc::snGrad(rho)
-                    + surfForces.accelerationForce()
-                    - fvc::snGrad(p_rgh)
-                ) * mesh.magSf()
-            ),
+         == capillaryVerificationMomentumResidualScale*momentumRhsDiagnostic,
             mesh.solver(U.select(finalIter))
         );
 
@@ -138,6 +176,7 @@
         {
             Info<< "CAPMOMPOST time " << runTime.value()
                 << " oCorr " << oCorr
+                << " scale " << capillaryVerificationMomentumResidualScale
                 << " maxU " << gMax(mag(U.primitiveField()))
                 << endl;
         }
