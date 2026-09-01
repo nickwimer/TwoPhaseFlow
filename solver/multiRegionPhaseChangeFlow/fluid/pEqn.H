@@ -9,6 +9,64 @@
         false
     );
 
+    // Verification-only controls used by Case 202 to isolate the inherited
+    // compressible-VOF pressure coupling. The defaults preserve the production
+    // equations exactly. These are not physical model switches and must remain
+    // at 1 outside controlled verification fixtures.
+    const scalar capillaryVerificationVaporDensityTransportScale =
+        pimple.lookupOrDefault<scalar>
+        (
+            "capillaryVerificationVaporDensityTransportScale",
+            1.0
+        );
+    const scalar capillaryVerificationVaporPressureDdtScale =
+        pimple.lookupOrDefault<scalar>
+        (
+            "capillaryVerificationVaporPressureDdtScale",
+            1.0
+        );
+    const scalar capillaryVerificationVaporDensityUpdateScale =
+        pimple.lookupOrDefault<scalar>
+        (
+            "capillaryVerificationVaporDensityUpdateScale",
+            1.0
+        );
+
+    if
+    (
+        capillaryVerificationVaporDensityTransportScale < 0
+     || capillaryVerificationVaporPressureDdtScale < 0
+     || capillaryVerificationVaporDensityUpdateScale < 0
+    )
+    {
+        FatalErrorInFunction
+            << "Case-202 vapor-coupling verification scales must be >= 0: "
+            << capillaryVerificationVaporDensityTransportScale << ' '
+            << capillaryVerificationVaporPressureDdtScale << ' '
+            << capillaryVerificationVaporDensityUpdateScale
+            << exit(FatalError);
+    }
+
+    if
+    (
+        corr == 0
+     &&
+        (
+            mag(capillaryVerificationVaporDensityTransportScale - 1.0) > SMALL
+         || mag(capillaryVerificationVaporPressureDdtScale - 1.0) > SMALL
+         || mag(capillaryVerificationVaporDensityUpdateScale - 1.0) > SMALL
+        )
+    )
+    {
+        Info<< "CAPVFY vapor coupling scales: densityTransport="
+            << capillaryVerificationVaporDensityTransportScale
+            << " pressureDdt="
+            << capillaryVerificationVaporPressureDdtScale
+            << " densityUpdate="
+            << capillaryVerificationVaporDensityUpdateScale
+            << endl;
+    }
+
     volScalarField rAU("rAU", 1.0/UEqn.A());
     surfaceScalarField rAUf("rAUf", fvc::interpolate(rAU));
     volVectorField HbyA(constrainHbyA(rAU*UEqn.H(), U, p_rgh));
@@ -56,12 +114,16 @@
         p_rghEqnComp2 =
             pos(alpha2)
            *(
-               (
-                   fvc::ddt(alpha2, rho2) + fvc::div(alphaPhi2*rho2f)
-                 - (fvOptions(alpha2, mixture.thermo2().rho())&rho2)
-               )/rho2
-             - fvc::ddt(alpha2) - fvc::div(alphaPhi2)
-             + (alpha2*psi2/rho2)*correction(fvm::ddt(p_rgh))
+                capillaryVerificationVaporDensityTransportScale
+               *(
+                    (
+                        fvc::ddt(alpha2, rho2) + fvc::div(alphaPhi2*rho2f)
+                      - (fvOptions(alpha2, mixture.thermo2().rho())&rho2)
+                    )/rho2
+                  - fvc::ddt(alpha2) - fvc::div(alphaPhi2)
+                )
+              + capillaryVerificationVaporPressureDdtScale
+               *(alpha2*psi2/rho2)*correction(fvm::ddt(p_rgh))
             );
     }
 
@@ -186,9 +248,14 @@
     }
     else
     {
-        // Update densities from change in p_rgh
+        // Update densities from change in p_rgh. The vapor scale is a
+        // verification-only Case-202 control; production behavior is 1.0.
         mixture.thermo1().correctRho(psi1*(p_rgh - p_rgh_0));
-        mixture.thermo2().correctRho(psi2*(p_rgh - p_rgh_0));
+        mixture.thermo2().correctRho
+        (
+            capillaryVerificationVaporDensityUpdateScale
+           *psi2*(p_rgh - p_rgh_0)
+        );
     }
 
     rho = alpha1*rho1 + alpha2*rho2;
