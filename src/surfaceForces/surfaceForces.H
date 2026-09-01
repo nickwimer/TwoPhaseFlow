@@ -36,6 +36,8 @@ SourceFiles
 #include "dimensionedScalar.H"
 #include "autoPtr.H"
 #include "Pair.H"
+#include "Switch.H"
+#include "PstreamReduceOps.H"
 
 #include "IOdictionary.H"
 #include "volFields.H"
@@ -123,6 +125,108 @@ public:
         {
             surfTenForceModel_->correct();
             accModel_->correct();
+
+            // Verification-only curvature-oracle diagnostics for canonical
+            // interfaces such as Case 202. Defaults are disabled and do not
+            // alter the selected surface-tension model or its force.
+            const dictionary& controlDict = mesh_.time().controlDict();
+            const Switch curvatureDiagnostics =
+                controlDict.lookupOrDefault<Switch>
+                (
+                    "capillaryVerificationCurvatureDiagnostics",
+                    false
+                );
+
+            if (curvatureDiagnostics)
+            {
+                const scalar exactCurvature =
+                    controlDict.lookupOrDefault<scalar>
+                    (
+                        "capillaryVerificationExactCurvature",
+                        0.0
+                    );
+                const scalar alphaTol =
+                    controlDict.lookupOrDefault<scalar>
+                    (
+                        "capillaryVerificationInterfaceAlphaTol",
+                        1e-8
+                    );
+
+                if (alphaTol <= 0 || alphaTol >= 0.5)
+                {
+                    FatalErrorInFunction
+                        << "capillaryVerificationInterfaceAlphaTol must be "
+                        << "in (0, 0.5): " << alphaTol
+                        << exit(FatalError);
+                }
+
+                const volScalarField& curvature = surfTenForceModel_->K();
+                label nInterface = 0;
+                scalar minCurvature = GREAT;
+                scalar maxCurvature = -GREAT;
+                scalar sumCurvature = 0.0;
+                scalar sumAbsError = 0.0;
+                scalar sumSqError = 0.0;
+                scalar maxAbsError = 0.0;
+
+                const scalarField& alphaInternal = alpha1_.primitiveField();
+                const scalarField& curvatureInternal = curvature.primitiveField();
+
+                forAll(alphaInternal, celli)
+                {
+                    const scalar alpha = alphaInternal[celli];
+                    if (alpha > alphaTol && alpha < 1.0 - alphaTol)
+                    {
+                        const scalar k = curvatureInternal[celli];
+                        const scalar error = k - exactCurvature;
+                        ++nInterface;
+                        minCurvature = min(minCurvature, k);
+                        maxCurvature = max(maxCurvature, k);
+                        sumCurvature += k;
+                        sumAbsError += mag(error);
+                        sumSqError += error*error;
+                        maxAbsError = max(maxAbsError, mag(error));
+                    }
+                }
+
+                reduce(nInterface, sumOp<label>());
+                reduce(minCurvature, minOp<scalar>());
+                reduce(maxCurvature, maxOp<scalar>());
+                reduce(sumCurvature, sumOp<scalar>());
+                reduce(sumAbsError, sumOp<scalar>());
+                reduce(sumSqError, sumOp<scalar>());
+                reduce(maxAbsError, maxOp<scalar>());
+
+                if (nInterface > 0)
+                {
+                    const scalar meanCurvature =
+                        sumCurvature/scalar(nInterface);
+                    const scalar meanAbsError =
+                        sumAbsError/scalar(nInterface);
+                    const scalar rmsError =
+                        sqrt(sumSqError/scalar(nInterface));
+
+                    Info<< "CAPK time " << mesh_.time().value()
+                        << " exactK " << exactCurvature
+                        << " alphaTol " << alphaTol
+                        << " nInterface " << nInterface
+                        << " minK " << minCurvature
+                        << " maxK " << maxCurvature
+                        << " meanK " << meanCurvature
+                        << " meanAbsError " << meanAbsError
+                        << " rmsError " << rmsError
+                        << " maxAbsError " << maxAbsError
+                        << endl;
+                }
+                else
+                {
+                    Info<< "CAPK time " << mesh_.time().value()
+                        << " exactK " << exactCurvature
+                        << " alphaTol " << alphaTol
+                        << " nInterface 0"
+                        << endl;
+                }
+            }
         }
 
         const volScalarField& acc() const
