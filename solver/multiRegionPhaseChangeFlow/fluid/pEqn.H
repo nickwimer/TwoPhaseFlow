@@ -45,6 +45,12 @@
             "capillaryVerificationDgdtScale",
             1.0
         );
+    const scalar capillaryVerificationDdtCorrScale =
+        verificationControlDict.lookupOrDefault<scalar>
+        (
+            "capillaryVerificationDdtCorrScale",
+            1.0
+        );
 
     if
     (
@@ -52,6 +58,7 @@
      || capillaryVerificationVaporPressureDdtScale < 0
      || capillaryVerificationVaporDensityUpdateScale < 0
      || capillaryVerificationDgdtScale < 0
+     || capillaryVerificationDdtCorrScale < 0
     )
     {
         FatalErrorInFunction
@@ -59,7 +66,8 @@
             << capillaryVerificationVaporDensityTransportScale << ' '
             << capillaryVerificationVaporPressureDdtScale << ' '
             << capillaryVerificationVaporDensityUpdateScale << ' '
-            << capillaryVerificationDgdtScale
+            << capillaryVerificationDgdtScale << ' '
+            << capillaryVerificationDdtCorrScale
             << exit(FatalError);
     }
 
@@ -72,17 +80,42 @@
             << " densityUpdate="
             << capillaryVerificationVaporDensityUpdateScale
             << " dgdt=" << capillaryVerificationDgdtScale
+            << " ddtCorr=" << capillaryVerificationDdtCorrScale
             << endl;
     }
 
     volScalarField rAU("rAU", 1.0/UEqn.A());
     surfaceScalarField rAUf("rAUf", fvc::interpolate(rAU));
     volVectorField HbyA(constrainHbyA(rAU*UEqn.H(), U, p_rgh));
+
+    surfaceScalarField rawDdtCorrFlux
+    (
+        "rawDdtCorrFlux",
+        MRF.zeroFilter
+        (
+            fvc::interpolate(rho*rAU)*fvc::ddtCorr(U, phi, UfFluid[i])
+        )
+    );
+
+    if (capillaryVerificationEnabled)
+    {
+        Info<< "CAPDDTCORR time " << runTime.value()
+            << " oCorr " << oCorr
+            << " corr " << corr
+            << " scale " << capillaryVerificationDdtCorrScale
+            << " rawMaxAbs "
+            << gMax(mag(rawDdtCorrFlux.primitiveField()))
+            << " scaledMaxAbs "
+            << capillaryVerificationDdtCorrScale
+               *gMax(mag(rawDdtCorrFlux.primitiveField()))
+            << endl;
+    }
+
     surfaceScalarField phiHbyA
     (
         "phiHbyA",
         fvc::flux(HbyA)
-      + MRF.zeroFilter(fvc::interpolate(rho*rAU)*fvc::ddtCorr(U, phi, UfFluid[i]))
+      + capillaryVerificationDdtCorrScale*rawDdtCorrFlux
     );
     MRF.makeRelative(phiHbyA);
 
@@ -207,6 +240,21 @@
               + rAU*fvc::reconstruct((phig + p_rghEqnIncomp.flux())/rAUf);
             U.correctBoundaryConditions();
             fvOptions.correct(U);
+
+            if (capillaryVerificationEnabled)
+            {
+                surfaceScalarField phiUMismatch
+                (
+                    "phiUMismatch",
+                    phi - fvc::flux(U)
+                );
+                Info<< "CAPPHIU time " << runTime.value()
+                    << " oCorr " << oCorr
+                    << " corr " << corr
+                    << " maxAbs "
+                    << gMax(mag(phiUMismatch.primitiveField()))
+                    << endl;
+            }
 
             if (capillaryBalanceDiagnostics)
             {
