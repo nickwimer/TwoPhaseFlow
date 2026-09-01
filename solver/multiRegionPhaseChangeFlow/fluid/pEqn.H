@@ -343,6 +343,109 @@
     p_rgh = p - rho*gh;
     p_rgh.correctBoundaryConditions();
 
+    if (capillaryVerificationEnabled)
+    {
+        surfaceScalarField capillaryFaceForcePressurePatchDiagnostic
+        (
+            "capillaryFaceForcePressurePatchDiagnostic",
+            surfForces.surfaceTensionForce()
+          + surfForces.accelerationForce()
+        );
+        surfaceScalarField pressureFaceGradientPressurePatchDiagnostic
+        (
+            "pressureFaceGradientPressurePatchDiagnostic",
+            fvc::snGrad(p_rgh)
+        );
+        surfaceScalarField capillaryPressureResidualPressurePatchDiagnostic
+        (
+            "capillaryPressureResidualPressurePatchDiagnostic",
+            capillaryFaceForcePressurePatchDiagnostic
+          - pressureFaceGradientPressurePatchDiagnostic
+        );
+
+        const surfaceScalarField::Boundary& capillaryBoundary =
+            capillaryFaceForcePressurePatchDiagnostic.boundaryField();
+        const surfaceScalarField::Boundary& pressureGradientBoundary =
+            pressureFaceGradientPressurePatchDiagnostic.boundaryField();
+        const surfaceScalarField::Boundary& residualBoundary =
+            capillaryPressureResidualPressurePatchDiagnostic.boundaryField();
+        const volScalarField::Boundary& pRghBoundary = p_rgh.boundaryField();
+
+        forAll(pRghBoundary, patchi)
+        {
+            label nPatchFaces = pRghBoundary[patchi].size();
+            reduce(nPatchFaces, sumOp<label>());
+            if (!nPatchFaces)
+            {
+                continue;
+            }
+
+            scalar pBoundaryMin = GREAT;
+            scalar pBoundaryMax = -GREAT;
+            scalar pInternalMin = GREAT;
+            scalar pInternalMax = -GREAT;
+            scalar maxDeltaP = 0.0;
+            scalar maxCapillary = 0.0;
+            scalar maxPressureGradient = 0.0;
+            scalar maxResidual = 0.0;
+            const labelUList& faceCells = mesh.boundary()[patchi].faceCells();
+
+            forAll(pRghBoundary[patchi], facei)
+            {
+                const scalar pBoundaryValue = pRghBoundary[patchi][facei];
+                const scalar pInternalValue = p_rgh[faceCells[facei]];
+                pBoundaryMin = min(pBoundaryMin, pBoundaryValue);
+                pBoundaryMax = max(pBoundaryMax, pBoundaryValue);
+                pInternalMin = min(pInternalMin, pInternalValue);
+                pInternalMax = max(pInternalMax, pInternalValue);
+                maxDeltaP = max
+                (
+                    maxDeltaP,
+                    mag(pBoundaryValue - pInternalValue)
+                );
+                maxCapillary = max
+                (
+                    maxCapillary,
+                    mag(capillaryBoundary[patchi][facei])
+                );
+                maxPressureGradient = max
+                (
+                    maxPressureGradient,
+                    mag(pressureGradientBoundary[patchi][facei])
+                );
+                maxResidual = max
+                (
+                    maxResidual,
+                    mag(residualBoundary[patchi][facei])
+                );
+            }
+
+            reduce(pBoundaryMin, minOp<scalar>());
+            reduce(pBoundaryMax, maxOp<scalar>());
+            reduce(pInternalMin, minOp<scalar>());
+            reduce(pInternalMax, maxOp<scalar>());
+            reduce(maxDeltaP, maxOp<scalar>());
+            reduce(maxCapillary, maxOp<scalar>());
+            reduce(maxPressureGradient, maxOp<scalar>());
+            reduce(maxResidual, maxOp<scalar>());
+
+            Info<< "CAPPATCHP time " << runTime.value()
+                << " oCorr " << oCorr
+                << " corr " << corr
+                << " patch " << mesh.boundary()[patchi].name()
+                << " pType " << pRghBoundary[patchi].type()
+                << " pBoundaryMin " << pBoundaryMin
+                << " pBoundaryMax " << pBoundaryMax
+                << " pInternalMin " << pInternalMin
+                << " pInternalMax " << pInternalMax
+                << " maxDeltaP " << maxDeltaP
+                << " maxCapillary " << maxCapillary
+                << " maxPressureGrad " << maxPressureGradient
+                << " maxResidual " << maxResidual
+                << endl;
+        }
+    }
+
     Info<< "max(U) " << max(mag(U)).value() << endl;
     Info<< "min(p_rgh) " << min(p_rgh).value()
         << "  average(p_rgh) " << p_rgh.weightedAverage(mesh.V()) << endl;
