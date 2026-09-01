@@ -92,9 +92,21 @@ distributedSurfaceTopologyBirth::distributedSurfaceTopologyBirth
     (
         modelDict().lookupOrDefault<scalar>("thermalReserveFraction", 0.0)
     ),
+    sourceCouplingMode_
+    (
+        modelDict().lookupOrDefault<word>
+        (
+            "sourceCouplingMode",
+            "conservative"
+        )
+    ),
     exclusionRadius_
     (
         modelDict().lookupOrDefault<scalar>("exclusionRadius", 0.0)
+    ),
+    exclusionRadiusFactor_
+    (
+        modelDict().lookupOrDefault<scalar>("exclusionRadiusFactor", 2.5)
     ),
     cooldownTime_
     (
@@ -118,6 +130,8 @@ distributedSurfaceTopologyBirth::distributedSurfaceTopologyBirth
     ),
     lastUpdateTimeIndex_(-1),
     nextEventId_(0),
+    cumulativeTopologyMassDefect_(0),
+    cumulativeTopologyLatentDefect_(0),
     eventCentres_(),
     eventNormals_(),
     eventRadii_(),
@@ -213,6 +227,34 @@ distributedSurfaceTopologyBirth::distributedSurfaceTopologyBirth
         phase1.mesh(),
         dimensionedScalar("zero", dimPower/dimVol, 0.0),
         "zeroGradient"
+    ),
+    equivalentMassDefectRate_
+    (
+        IOobject
+        (
+            word(diagnosticPrefix_ + "EquivalentMassDefectRate"),
+            phase1.mesh().time().timeName(),
+            phase1.mesh(),
+            IOobject::NO_READ,
+            writeDiagnostics_ ? IOobject::AUTO_WRITE : IOobject::NO_WRITE
+        ),
+        phase1.mesh(),
+        dimensionedScalar("zero", dimDensity/dimTime, 0.0),
+        "zeroGradient"
+    ),
+    equivalentLatentDefectRate_
+    (
+        IOobject
+        (
+            word(diagnosticPrefix_ + "EquivalentLatentDefectRate"),
+            phase1.mesh().time().timeName(),
+            phase1.mesh(),
+            IOobject::NO_READ,
+            writeDiagnostics_ ? IOobject::AUTO_WRITE : IOobject::NO_WRITE
+        ),
+        phase1.mesh(),
+        dimensionedScalar("zero", dimPower/dimVol, 0.0),
+        "zeroGradient"
     )
 {
     validateControls();
@@ -223,6 +265,7 @@ distributedSurfaceTopologyBirth::distributedSurfaceTopologyBirth
         << " 1/(m2 s), seedRadiusCells=" << seedRadiusCells_
         << ", seedCreationDuration=" << seedCreationDuration_ << " s"
         << ", targetSeedVaporFraction=" << targetSeedVaporFraction_
+        << ", sourceCouplingMode=" << sourceCouplingMode_
         << endl;
 }
 
@@ -358,10 +401,28 @@ void distributedSurfaceTopologyBirth::validateControls() const
             << exit(FatalError);
     }
 
-    if (exclusionRadius_ < 0 || cooldownTime_ < 0)
+    if
+    (
+        sourceCouplingMode_ != "conservative"
+     && sourceCouplingMode_ != "topologyOnly"
+    )
     {
         FatalErrorInFunction
-            << "exclusionRadius and cooldownTime must be non-negative."
+            << "sourceCouplingMode must be conservative or topologyOnly; found "
+            << sourceCouplingMode_
+            << exit(FatalError);
+    }
+
+    if
+    (
+        exclusionRadius_ < 0
+     || exclusionRadiusFactor_ <= SMALL
+     || cooldownTime_ < 0
+    )
+    {
+        FatalErrorInFunction
+            << "exclusionRadius and cooldownTime must be non-negative and "
+            << "exclusionRadiusFactor must be positive."
             << exit(FatalError);
     }
 
@@ -630,7 +691,7 @@ label distributedSurfaceTopologyBirth::spawnEvents
             const scalar localExclusionRadius =
                 exclusionRadius_ > 0
               ? exclusionRadius_
-              : 2.5*radius;
+              : exclusionRadiusFactor_*radius;
 
             const label eventId = nextEventId_++;
 
@@ -676,6 +737,7 @@ label distributedSurfaceTopologyBirth::spawnEvents
                 << " wallSuperheat=" << wallSuperheat
                 << " hazardRate=" << hazard
                 << " probability=" << eventProbability
+                << " couplingMode=" << sourceCouplingMode_
                 << endl;
         }
     }
@@ -692,12 +754,16 @@ void distributedSurfaceTopologyBirth::applyActiveEvents
     scalar& integratedAlphaSource,
     scalar& integratedMassSource,
     scalar& integratedLatentSink,
+    scalar& integratedTopologyMassDefectRate,
+    scalar& integratedTopologyLatentDefectRate,
     scalar& maxAlphaRate
 )
 {
     const fvMesh& mesh = phase1_.mesh();
     const scalar deltaT = mesh.time().deltaTValue();
     const scalar timeValue = mesh.time().value();
+    const bool conservativeCoupling =
+        sourceCouplingMode_ == "conservative";
 
     if (deltaT <= SMALL)
     {
@@ -744,7 +810,7 @@ void distributedSurfaceTopologyBirth::applyActiveEvents
         alphaStep =
             min(alphaStep, max(phase1_[celli], scalar(0)));
 
-        if (thermalReserveFraction_ > 0)
+        if (conservativeCoupling && thermalReserveFraction_ > 0)
         {
             const scalar latentHeat = satModel_.L()[celli];
             const scalar cellSuperheat =
@@ -771,20 +837,14 @@ void distributedSurfaceTopologyBirth::applyActiveEvents
             continue;
         }
 
-        const scalar alphaRate = alphaStep/deltaT;
-        const scalar massRate =
-            liquidDensity[celli]*alphaRate;
-        const scalar latentRate =
-            massRate*satModel_.L()[celli];
-
-        alphaBirthSource_[celli] += alphaRate;
-        massBirthSource_[celli] += massRate;
-        latentSink_[celli] += latentRate;
+        alphaBirthSource_[celli] += alphaStep/deltaT;
     }
 
     integratedAlphaSource = 0;
     integratedMassSource = 0;
     integratedLatentSink = 0;
+    integratedTopologyMassDefectRate = 0;
+    integratedTopologyLatentDefectRate = 0;
     maxAlphaRate = 0;
 
     forAll(alphaBirthSource_, celli)
@@ -799,13 +859,26 @@ void distributedSurfaceTopologyBirth::applyActiveEvents
          && alphaBirthSource_[celli] > SMALL
         )
         {
-            const scalar scale =
-                maxAlphaRateFromAvailableLiquid
-               /alphaBirthSource_[celli];
+            alphaBirthSource_[celli] =
+                maxAlphaRateFromAvailableLiquid;
+        }
 
-            alphaBirthSource_[celli] *= scale;
-            massBirthSource_[celli] *= scale;
-            latentSink_[celli] *= scale;
+        const scalar equivalentMassRate =
+            liquidDensity[celli]*alphaBirthSource_[celli];
+        const scalar equivalentLatentRate =
+            equivalentMassRate*satModel_.L()[celli];
+
+        if (conservativeCoupling)
+        {
+            massBirthSource_[celli] = equivalentMassRate;
+            latentSink_[celli] = equivalentLatentRate;
+        }
+        else
+        {
+            equivalentMassDefectRate_[celli] =
+                equivalentMassRate;
+            equivalentLatentDefectRate_[celli] =
+                equivalentLatentRate;
         }
 
         integratedAlphaSource +=
@@ -814,6 +887,10 @@ void distributedSurfaceTopologyBirth::applyActiveEvents
             massBirthSource_[celli]*mesh.V()[celli];
         integratedLatentSink +=
             latentSink_[celli]*mesh.V()[celli];
+        integratedTopologyMassDefectRate +=
+            equivalentMassDefectRate_[celli]*mesh.V()[celli];
+        integratedTopologyLatentDefectRate +=
+            equivalentLatentDefectRate_[celli]*mesh.V()[celli];
         maxAlphaRate =
             max(maxAlphaRate, alphaBirthSource_[celli]);
     }
@@ -837,6 +914,8 @@ void distributedSurfaceTopologyBirth::updateSources()
     alphaBirthSource_ *= scalar(0);
     massBirthSource_ *= scalar(0);
     latentSink_ *= scalar(0);
+    equivalentMassDefectRate_ *= scalar(0);
+    equivalentLatentDefectRate_ *= scalar(0);
 
     const volScalarField& liquidTemperature =
         phase1_.thermo().T();
@@ -855,6 +934,8 @@ void distributedSurfaceTopologyBirth::updateSources()
     scalar integratedAlphaSource = 0;
     scalar integratedMassSource = 0;
     scalar integratedLatentSink = 0;
+    scalar integratedTopologyMassDefectRate = 0;
+    scalar integratedTopologyLatentDefectRate = 0;
     scalar maxAlphaRate = 0;
 
     applyActiveEvents
@@ -865,8 +946,21 @@ void distributedSurfaceTopologyBirth::updateSources()
         integratedAlphaSource,
         integratedMassSource,
         integratedLatentSink,
+        integratedTopologyMassDefectRate,
+        integratedTopologyLatentDefectRate,
         maxAlphaRate
     );
+
+    const scalar deltaT = mesh.time().deltaTValue();
+    const scalar topologyMassDefectThisStep =
+        integratedTopologyMassDefectRate*deltaT;
+    const scalar topologyLatentDefectThisStep =
+        integratedTopologyLatentDefectRate*deltaT;
+
+    cumulativeTopologyMassDefect_ +=
+        topologyMassDefectThisStep;
+    cumulativeTopologyLatentDefect_ +=
+        topologyLatentDefectThisStep;
 
     superheat_.correctBoundaryConditions();
     eligibleMask_.correctBoundaryConditions();
@@ -874,6 +968,8 @@ void distributedSurfaceTopologyBirth::updateSources()
     alphaBirthSource_.correctBoundaryConditions();
     massBirthSource_.correctBoundaryConditions();
     latentSink_.correctBoundaryConditions();
+    equivalentMassDefectRate_.correctBoundaryConditions();
+    equivalentLatentDefectRate_.correctBoundaryConditions();
 
     if (writeDiagnostics_)
     {
@@ -885,17 +981,30 @@ void distributedSurfaceTopologyBirth::updateSources()
 
         Info<< "DSTB"
             << " time=" << mesh.time().value()
+            << " couplingMode=" << sourceCouplingMode_
             << " eligibleCells=" << eligibleCells
             << " births=" << birthsThisStep
             << " activeEvents="
             << activeEventCount(mesh.time().value())
-            << " totalEvents=" << eventCentres_.size()
+            << " totalEvents=" << nextEventId_
             << " integratedAlphaSource="
             << integratedAlphaSource
             << " integratedMassSource="
             << integratedMassSource
             << " integratedLatentSink="
             << integratedLatentSink
+            << " integratedTopologyMassDefectRate="
+            << integratedTopologyMassDefectRate
+            << " integratedTopologyLatentDefectRate="
+            << integratedTopologyLatentDefectRate
+            << " topologyMassDefectThisStep="
+            << topologyMassDefectThisStep
+            << " topologyLatentDefectThisStep="
+            << topologyLatentDefectThisStep
+            << " cumulativeTopologyMassDefect="
+            << cumulativeTopologyMassDefect_
+            << " cumulativeTopologyLatentDefect="
+            << cumulativeTopologyLatentDefect_
             << " maxAlphaRate=" << maxAlphaRate
             << " maxWallSuperheat=" << gMax(superheat_)
             << endl;
