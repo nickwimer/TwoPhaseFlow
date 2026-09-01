@@ -57,6 +57,13 @@ private:
     DynamicList<scalar> eventEndTimes_;
     DynamicList<label> eventIds_;
 
+    // Flat seed stencils are built once at event creation. This avoids
+    // scanning the complete mesh for every active event on every CFD step.
+    DynamicList<label> seedCellLabels_;
+    DynamicList<scalar> seedCellTargetVapor_;
+    DynamicList<scalar> seedCellEndTimes_;
+    DynamicList<label> seedCellEventIds_;
+
     DynamicList<vector> recentCentres_;
     DynamicList<scalar> recentExclusionRadii_;
     DynamicList<scalar> recentExpiryTimes_;
@@ -86,6 +93,15 @@ private:
     ) const;
 
     label activeEventCount(const scalar timeValue) const;
+
+    label appendSeedStencil
+    (
+        const vector& wallCentre,
+        const vector& inwardNormal,
+        const scalar radius,
+        const scalar eventEnd,
+        const label eventId
+    );
 
     label spawnEvents
     (

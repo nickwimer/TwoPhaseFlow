@@ -123,6 +123,10 @@ distributedSurfaceTopologyBirth::distributedSurfaceTopologyBirth
     eventRadii_(),
     eventEndTimes_(),
     eventIds_(),
+    seedCellLabels_(),
+    seedCellTargetVapor_(),
+    seedCellEndTimes_(),
+    seedCellEventIds_(),
     recentCentres_(),
     recentExclusionRadii_(),
     recentExpiryTimes_(),
@@ -446,6 +450,69 @@ label distributedSurfaceTopologyBirth::activeEventCount
 }
 
 
+label distributedSurfaceTopologyBirth::appendSeedStencil
+(
+    const vector& wallCentre,
+    const vector& inwardNormal,
+    const scalar radius,
+    const scalar eventEnd,
+    const label eventId
+)
+{
+    const fvMesh& mesh = phase1_.mesh();
+    const volVectorField& cellCentres = mesh.C();
+
+    label appended = 0;
+
+    forAll(phase1_, celli)
+    {
+        const scalar cellVolume = mesh.V()[celli];
+        if (cellVolume <= VSMALL)
+        {
+            continue;
+        }
+
+        const scalar cellSize =
+            std::cbrt(max(cellVolume, scalar(VSMALL)));
+        const vector displacement =
+            cellCentres[celli] - wallCentre;
+        const scalar wallNormalDistance =
+            displacement & inwardNormal;
+
+        if
+        (
+            wallNormalDistance < -0.5*cellSize
+         || wallNormalDistance > radius + cellSize
+        )
+        {
+            continue;
+        }
+
+        const scalar interfaceWidth =
+            max(interfaceWidthCells_*cellSize, scalar(SMALL));
+        const scalar radialDistance = mag(displacement);
+
+        scalar shape =
+            (radius + 0.5*interfaceWidth - radialDistance)
+           /interfaceWidth;
+        shape = min(max(shape, scalar(0)), scalar(1));
+
+        if (shape <= SMALL)
+        {
+            continue;
+        }
+
+        seedCellLabels_.append(celli);
+        seedCellTargetVapor_.append(targetSeedVaporFraction_*shape);
+        seedCellEndTimes_.append(eventEnd);
+        seedCellEventIds_.append(eventId);
+        ++appended;
+    }
+
+    return appended;
+}
+
+
 label distributedSurfaceTopologyBirth::spawnEvents
 (
     const volScalarField& liquidTemperature
@@ -573,6 +640,25 @@ label distributedSurfaceTopologyBirth::spawnEvents
             eventEndTimes_.append(eventEnd);
             eventIds_.append(eventId);
 
+            const label stencilCells =
+                appendSeedStencil
+                (
+                    faceCentres[facei],
+                    inwardNormal,
+                    radius,
+                    eventEnd,
+                    eventId
+                );
+
+            if (stencilCells == 0)
+            {
+                FatalErrorInFunction
+                    << "Event " << eventId
+                    << " generated an empty seed stencil at "
+                    << faceCentres[facei]
+                    << exit(FatalError);
+            }
+
             recentCentres_.append(faceCentres[facei]);
             recentExclusionRadii_.append(localExclusionRadius);
             recentExpiryTimes_.append(eventEnd + cooldownTime_);
@@ -586,6 +672,7 @@ label distributedSurfaceTopologyBirth::spawnEvents
                 << " face=" << facei
                 << " centre=" << faceCentres[facei]
                 << " seedRadius=" << radius
+                << " stencilCells=" << stencilCells
                 << " wallSuperheat=" << wallSuperheat
                 << " hazardRate=" << hazard
                 << " probability=" << eventProbability
@@ -609,7 +696,6 @@ void distributedSurfaceTopologyBirth::applyActiveEvents
 )
 {
     const fvMesh& mesh = phase1_.mesh();
-    const volVectorField& cellCentres = mesh.C();
     const scalar deltaT = mesh.time().deltaTValue();
     const scalar timeValue = mesh.time().value();
 
@@ -618,119 +704,82 @@ void distributedSurfaceTopologyBirth::applyActiveEvents
         return;
     }
 
-    forAll(eventCentres_, eventi)
+    forAll(seedCellLabels_, stencilI)
     {
-        if (eventEndTimes_[eventi] + SMALL < timeValue)
+        if (seedCellEndTimes_[stencilI] + SMALL < timeValue)
         {
             continue;
         }
 
-        const vector& wallCentre = eventCentres_[eventi];
-        const vector& inwardNormal = eventNormals_[eventi];
-        const scalar radius = eventRadii_[eventi];
+        const label celli = seedCellLabels_[stencilI];
+        const scalar targetVapor = seedCellTargetVapor_[stencilI];
         const scalar remainingDuration =
-            max(eventEndTimes_[eventi] - timeValue, deltaT);
+            max(seedCellEndTimes_[stencilI] - timeValue, deltaT);
         const scalar scheduleFraction =
             min(deltaT/remainingDuration, scalar(1));
 
-        forAll(phase1_, celli)
-        {
-            const scalar cellVolume = mesh.V()[celli];
-            if (cellVolume <= VSMALL)
-            {
-                continue;
-            }
-
-            const scalar cellSize =
-                std::cbrt(max(cellVolume, scalar(VSMALL)));
-            const vector displacement =
-                cellCentres[celli] - wallCentre;
-            const scalar wallNormalDistance =
-                displacement & inwardNormal;
-
-            if
+        activeSeedMask_[celli] =
+            max
             (
-                wallNormalDistance < -0.5*cellSize
-             || wallNormalDistance > radius + cellSize
-            )
-            {
-                continue;
-            }
+                activeSeedMask_[celli],
+                targetVapor/max(targetSeedVaporFraction_, scalar(SMALL))
+            );
 
-            const scalar interfaceWidth =
-                max(interfaceWidthCells_*cellSize, scalar(SMALL));
-            const scalar radialDistance = mag(displacement);
+        const scalar currentVapor =
+            scalar(1) - phase1_[celli];
+        const scalar vaporDeficit =
+            targetVapor - currentVapor;
 
-            scalar shape =
-                (radius + 0.5*interfaceWidth - radialDistance)
-               /interfaceWidth;
-            shape = min(max(shape, scalar(0)), scalar(1));
-
-            if (shape <= SMALL)
-            {
-                continue;
-            }
-
-            activeSeedMask_[celli] =
-                max(activeSeedMask_[celli], shape);
-
-            const scalar targetVapor =
-                targetSeedVaporFraction_*shape;
-            const scalar currentVapor =
-                scalar(1) - phase1_[celli];
-            const scalar vaporDeficit =
-                targetVapor - currentVapor;
-
-            if (vaporDeficit <= SMALL || phase1_[celli] <= SMALL)
-            {
-                continue;
-            }
-
-            scalar alphaStep =
-                min
-                (
-                    vaporDeficit*scheduleFraction,
-                    maxAlphaVaporPerStep_
-                );
-            alphaStep = min(alphaStep, max(phase1_[celli], scalar(0)));
-
-            if (thermalReserveFraction_ > 0)
-            {
-                const scalar latentHeat = satModel_.L()[celli];
-                const scalar cellSuperheat =
-                    max
-                    (
-                        liquidTemperature[celli] - TSat(celli),
-                        scalar(0)
-                    );
-
-                const scalar thermalAlphaLimit =
-                    latentHeat > SMALL
-                  ? thermalReserveFraction_
-                   *phase1_[celli]
-                   *liquidCp[celli]
-                   *cellSuperheat/latentHeat
-                  : scalar(0);
-
-                alphaStep =
-                    min(alphaStep, max(thermalAlphaLimit, scalar(0)));
-            }
-
-            if (alphaStep <= SMALL)
-            {
-                continue;
-            }
-
-            const scalar alphaRate = alphaStep/deltaT;
-            const scalar massRate =
-                liquidDensity[celli]*alphaRate;
-            const scalar latentRate =
-                massRate*satModel_.L()[celli];
-
-            alphaBirthSource_[celli] += alphaRate;
-            massBirthSource_[celli] += massRate;
-            latentSink_[celli] += latentRate;
+        if (vaporDeficit <= SMALL || phase1_[celli] <= SMALL)
+        {
+            continue;
         }
+
+        scalar alphaStep =
+            min
+            (
+                vaporDeficit*scheduleFraction,
+                maxAlphaVaporPerStep_
+            );
+        alphaStep =
+            min(alphaStep, max(phase1_[celli], scalar(0)));
+
+        if (thermalReserveFraction_ > 0)
+        {
+            const scalar latentHeat = satModel_.L()[celli];
+            const scalar cellSuperheat =
+                max
+                (
+                    liquidTemperature[celli] - TSat(celli),
+                    scalar(0)
+                );
+
+            const scalar thermalAlphaLimit =
+                latentHeat > SMALL
+              ? thermalReserveFraction_
+               *phase1_[celli]
+               *liquidCp[celli]
+               *cellSuperheat/latentHeat
+              : scalar(0);
+
+            alphaStep =
+                min(alphaStep, max(thermalAlphaLimit, scalar(0)));
+        }
+
+        if (alphaStep <= SMALL)
+        {
+            continue;
+        }
+
+        const scalar alphaRate = alphaStep/deltaT;
+        const scalar massRate =
+            liquidDensity[celli]*alphaRate;
+        const scalar latentRate =
+            massRate*satModel_.L()[celli];
+
+        alphaBirthSource_[celli] += alphaRate;
+        massBirthSource_[celli] += massRate;
+        latentSink_[celli] += latentRate;
     }
 
     integratedAlphaSource = 0;
