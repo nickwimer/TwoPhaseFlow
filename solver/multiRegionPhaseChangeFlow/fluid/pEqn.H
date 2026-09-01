@@ -3,6 +3,11 @@
     bool closedVolume = p_rgh.needReference();
     dimensionedScalar compressibility = fvc::domainIntegrate(psi);
     bool compressible = (compressibility.value() > SMALL);
+    const bool capillaryBalanceDiagnostics = pimple.lookupOrDefault
+    (
+        "capillaryBalanceDiagnostics",
+        false
+    );
 
     volScalarField rAU("rAU", 1.0/UEqn.A());
     surfaceScalarField rAUf("rAUf", fvc::interpolate(rAU));
@@ -69,7 +74,7 @@
     p_rghEqnComp1.ref() *= pos(alpha1);
     p_rghEqnComp2.ref() *= pos(alpha2);
 
-    // Cache p_rgh prior to solve for density update
+    // Cache p_rgh prior to solve for density update and diagnostics
     volScalarField p_rgh_0(p_rgh);
 
     for (int nonOrth=0; nonOrth<=nNonOrthCorr; nonOrth++)
@@ -112,6 +117,48 @@
               + rAU*fvc::reconstruct((phig + p_rghEqnIncomp.flux())/rAUf);
             U.correctBoundaryConditions();
             fvOptions.correct(U);
+
+            if (capillaryBalanceDiagnostics)
+            {
+                surfaceScalarField capillaryFaceForce
+                (
+                    "capillaryFaceForcePostPDiagnostic",
+                    surfForces.surfaceTensionForce()
+                  + surfForces.accelerationForce()
+                );
+                surfaceScalarField pressureFaceGradient
+                (
+                    "pressureFaceGradientPostPDiagnostic",
+                    fvc::snGrad(p_rgh)
+                );
+                surfaceScalarField capillaryPressureResidual
+                (
+                    "capillaryPressureResidualPostPDiagnostic",
+                    capillaryFaceForce - pressureFaceGradient
+                );
+
+                Info<< "CAPBAL postPEqn"
+                    << " time " << runTime.value()
+                    << " oCorr " << oCorr
+                    << " corr " << corr
+                    << " maxPDelta "
+                    << gMax
+                       (
+                           mag
+                           (
+                               p_rgh.primitiveField()
+                             - p_rgh_0.primitiveField()
+                           )
+                       )
+                    << " maxCapillary "
+                    << gMax(mag(capillaryFaceForce.primitiveField()))
+                    << " maxPressureGrad "
+                    << gMax(mag(pressureFaceGradient.primitiveField()))
+                    << " maxFaceResidual "
+                    << gMax(mag(capillaryPressureResidual.primitiveField()))
+                    << " maxU " << gMax(mag(U.primitiveField()))
+                    << endl;
+            }
         }
     }
 
