@@ -12,6 +12,55 @@
 
     fvOptions.constrain(UEqn);
 
+    {
+        const bool capillaryBalanceDiagnostics = pimple.lookupOrDefault
+        (
+            "capillaryBalanceDiagnostics",
+            false
+        );
+
+        if (capillaryBalanceDiagnostics)
+        {
+            surfaceScalarField capillaryFaceForce
+            (
+                "capillaryFaceForceDiagnostic",
+                surfForces.surfaceTensionForce()
+              + surfForces.accelerationForce()
+            );
+            surfaceScalarField pressureFaceGradient
+            (
+                "pressureFaceGradientDiagnostic",
+                fvc::snGrad(p_rgh)
+            );
+            surfaceScalarField capillaryPressureResidual
+            (
+                "capillaryPressureResidualDiagnostic",
+                capillaryFaceForce - pressureFaceGradient
+            );
+
+            Info<< "CAPBAL preUEqn"
+                << " time " << runTime.value()
+                << " oCorr " << oCorr
+                << " maxAlphaDeltaOld "
+                << gMax
+                   (
+                       mag
+                       (
+                           alpha1.primitiveField()
+                         - alpha1.oldTime().primitiveField()
+                       )
+                   )
+                << " maxCapillary "
+                << gMax(mag(capillaryFaceForce.primitiveField()))
+                << " maxPressureGrad "
+                << gMax(mag(pressureFaceGradient.primitiveField()))
+                << " maxFaceResidual "
+                << gMax(mag(capillaryPressureResidual.primitiveField()))
+                << " maxU " << gMax(mag(U.primitiveField()))
+                << endl;
+        }
+    }
+
     if (momentumPredictor)
     {
         solve
