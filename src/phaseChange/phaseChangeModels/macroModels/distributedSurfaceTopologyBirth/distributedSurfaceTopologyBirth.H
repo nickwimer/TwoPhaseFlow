@@ -62,13 +62,16 @@ private:
     DynamicList<scalar> eventEndTimes_;
     DynamicList<label> eventIds_;
 
-    // Flat seed stencils are built once at event creation. This avoids
-    // scanning the complete mesh for every active event on every CFD step.
+    // Flat local seed stencils are built once at event creation. In parallel,
+    // every accepted physical event is broadcast to all ranks and each rank
+    // stores only the cells it owns inside that seed.
     DynamicList<label> seedCellLabels_;
     DynamicList<scalar> seedCellTargetVapor_;
     DynamicList<scalar> seedCellEndTimes_;
     DynamicList<label> seedCellEventIds_;
 
+    // Replicated accepted-event history. Keeping this list identical on all
+    // ranks makes exclusion/cooldown decisions decomposition independent.
     DynamicList<vector> recentCentres_;
     DynamicList<scalar> recentExclusionRadii_;
     DynamicList<scalar> recentExpiryTimes_;
@@ -86,11 +89,13 @@ private:
 
     scalar TSat(const label celli) const;
 
+    // Stateless, decomposition-independent random draw. Heater face geometry,
+    // not processor-local face numbering, defines the event identity.
     scalar random01
     (
         const label timeIndex,
         const label patchOrdinal,
-        const label facei
+        const vector& faceCentre
     ) const;
 
     bool recentlyExcluded
