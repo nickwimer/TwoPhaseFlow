@@ -33,6 +33,29 @@ If `exclusionRadius` is zero, the footprint scales with the created seed radius
 through `exclusionRadiusFactor`. This is the preferred capability-mode setting
 because it permits denser surface populations as the mesh/seed scale is reduced.
 
+## MPI event synchronization
+
+The MPI implementation preserves a physical whole-surface event process instead
+of assigning permanent nucleation sites to processor domains.
+
+Each rank evaluates only the heater faces it owns. The stateless stochastic draw
+is keyed by time index, configured patch ordinal, and quantized physical face
+centre, so it does not depend on processor-local face numbering. Candidate events
+are gathered to rank 0, deterministically ordered by physical location, filtered
+by the global `maxBirthsPerStep` and exclusion/cooldown history, then broadcast to
+all ranks.
+
+Every accepted physical event is therefore represented identically on all ranks.
+Each rank builds only the portion of the hemispherical seed stencil that lies in
+its local cells. The accepted-event history is replicated, so exclusion/cooldown
+footprints cross processor boundaries. Source integrals and topology-defect
+metrics are globally reduced before diagnostic output.
+
+The first qualification target is decomposition invariance of event locations,
+birth count, resolved alpha visibility, and integral diagnostics for 1, 4, 8,
+and 16 ranks. Restart persistence of active event state is still a separate work
+item.
+
 ## Seed handoff
 
 `seedRadiusCells` converts the local wall-adjacent cell volume into a physical
@@ -79,6 +102,7 @@ creation would have required.
 
 ## Current qualification boundary
 
-The implementation is intentionally serial-only. Event ownership,
-decomposition-independent sampling, state persistence across restart, and
-cross-rank seed construction remain explicit MPI/restart work items.
+MPI event synchronization and cross-rank seed construction are implemented but
+must be qualified against the serial baseline before production use. In
+particular, decomposition invariance, restart persistence, and longer multi-node
+runs remain explicit verification items.
