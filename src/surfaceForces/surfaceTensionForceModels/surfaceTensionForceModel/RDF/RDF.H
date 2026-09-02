@@ -87,7 +87,11 @@ private:
 
     // Private Member Functions
         template <typename T>
-        void distributeField(const labelList& neiProcs,Field<T>& field);
+        void distributeField
+        (
+            const labelList& neiProcs,
+            DynamicField<T>& field
+        );
 
         scalar distanceToSurfacePlane(const point& p);
 
