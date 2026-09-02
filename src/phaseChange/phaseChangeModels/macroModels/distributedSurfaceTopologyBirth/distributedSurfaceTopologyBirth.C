@@ -742,28 +742,44 @@ label distributedSurfaceTopologyBirth::spawnEvents
     const List<label> localFaces(candidateLocalFaces);
 
     // Candidate counts are tiny compared with the CFD state. Replicate the
-    // complete candidate lists to every rank and let every rank execute the
-    // same physical sort/exclusion/cap logic. This removes the previous
-    // master-only selection + eleven variable-length broadcasts and keeps
-    // accepted-event state identical by construction.
-    const List<List<vector>> allCentres =
-        Pstream::allGatherValues(localCentres);
-    const List<List<vector>> allNormals =
-        Pstream::allGatherValues(localNormals);
-    const List<List<scalar>> allRadii =
-        Pstream::allGatherValues(localRadii);
-    const List<List<scalar>> allSuperheats =
-        Pstream::allGatherValues(localSuperheats);
-    const List<List<scalar>> allHazards =
-        Pstream::allGatherValues(localHazards);
-    const List<List<scalar>> allProbabilities =
-        Pstream::allGatherValues(localProbabilities);
-    const List<List<scalar>> allExclusionRadii =
-        Pstream::allGatherValues(localExclusionRadii);
-    const List<List<label>> allPatchOrdinals =
-        Pstream::allGatherValues(localPatchOrdinals);
-    const List<List<label>> allFaces =
-        Pstream::allGatherValues(localFaces);
+    // complete variable-length candidate lists to every rank and let every
+    // rank execute the same physical sort/exclusion/cap logic.
+    //
+    // allGatherValues is restricted to contiguous value types. The local
+    // candidate containers are themselves Lists, so use Pstream's stream-based
+    // allGatherList path for nested/variable-length data.
+    const label myProc = Pstream::myProcNo();
+    const label nProcs = Pstream::nProcs();
+
+    List<List<vector>> allCentres(nProcs);
+    List<List<vector>> allNormals(nProcs);
+    List<List<scalar>> allRadii(nProcs);
+    List<List<scalar>> allSuperheats(nProcs);
+    List<List<scalar>> allHazards(nProcs);
+    List<List<scalar>> allProbabilities(nProcs);
+    List<List<scalar>> allExclusionRadii(nProcs);
+    List<List<label>> allPatchOrdinals(nProcs);
+    List<List<label>> allFaces(nProcs);
+
+    allCentres[myProc] = localCentres;
+    allNormals[myProc] = localNormals;
+    allRadii[myProc] = localRadii;
+    allSuperheats[myProc] = localSuperheats;
+    allHazards[myProc] = localHazards;
+    allProbabilities[myProc] = localProbabilities;
+    allExclusionRadii[myProc] = localExclusionRadii;
+    allPatchOrdinals[myProc] = localPatchOrdinals;
+    allFaces[myProc] = localFaces;
+
+    Pstream::allGatherList(allCentres);
+    Pstream::allGatherList(allNormals);
+    Pstream::allGatherList(allRadii);
+    Pstream::allGatherList(allSuperheats);
+    Pstream::allGatherList(allHazards);
+    Pstream::allGatherList(allProbabilities);
+    Pstream::allGatherList(allExclusionRadii);
+    Pstream::allGatherList(allPatchOrdinals);
+    Pstream::allGatherList(allFaces);
 
     label totalCandidates = 0;
     forAll(allCentres, proci)
