@@ -95,7 +95,11 @@ Foam::RDF::RDF
 
 // * * * * * * * * * * * * * * Public Access Member Functions  * * * * * * * //
 template <typename T>
-void Foam::RDF::distributeField(const labelList& neiProcs,Field<T>& field)
+void Foam::RDF::distributeField
+(
+    const labelList& neiProcs,
+    DynamicField<T>& field
+)
 {
     Field<Field <T>> sendFields(Pstream::nProcs());
 
@@ -109,6 +113,10 @@ void Foam::RDF::distributeField(const labelList& neiProcs,Field<T>& field)
 
     Pstream::exchange<Field<T>, T>(sendFields, recvFields);
 
+    // Preserve DynamicField capacity bookkeeping while appending exchanged
+    // interface data. Treating a DynamicField as its Field base bypasses the
+    // capacity-aware resize path, which is unsafe for v2512 aligned List
+    // allocations and can deallocate an aligned buffer with plain delete[].
     forAll(recvFields,i)
     {
         field.append(recvFields[i]);
@@ -407,7 +415,7 @@ void Foam::RDF::correct()
         }
         if (!RDF_.nextToInterface()[cellI])
         {
-            K_[cellI]=  0;
+            K_[cellI]= 0;
         }
     }
 
