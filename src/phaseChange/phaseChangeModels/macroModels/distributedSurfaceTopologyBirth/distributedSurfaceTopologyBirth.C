@@ -8,6 +8,7 @@
 #include "fvPatch.H"
 #include "fvScalarMatrix.H"
 #include "Pstream.H"
+#include "PstreamReduceOps.H"
 
 #include <cmath>
 #include <cstdint>
@@ -259,29 +260,23 @@ distributedSurfaceTopologyBirth::distributedSurfaceTopologyBirth
 {
     validateControls();
 
-    Info<< "distributedSurfaceTopologyBirth: patches=" << patches_
-        << ", superheatThreshold=" << superheatThreshold_
-        << " K, baseHazardRate=" << baseHazardRate_
-        << " 1/(m2 s), seedRadiusCells=" << seedRadiusCells_
-        << ", seedCreationDuration=" << seedCreationDuration_ << " s"
-        << ", targetSeedVaporFraction=" << targetSeedVaporFraction_
-        << ", sourceCouplingMode=" << sourceCouplingMode_
-        << endl;
+    if (Pstream::master())
+    {
+        Info<< "distributedSurfaceTopologyBirth: patches=" << patches_
+            << ", superheatThreshold=" << superheatThreshold_
+            << " K, baseHazardRate=" << baseHazardRate_
+            << " 1/(m2 s), seedRadiusCells=" << seedRadiusCells_
+            << ", seedCreationDuration=" << seedCreationDuration_ << " s"
+            << ", targetSeedVaporFraction=" << targetSeedVaporFraction_
+            << ", sourceCouplingMode=" << sourceCouplingMode_
+            << ", parallel=" << Pstream::parRun()
+            << endl;
+    }
 }
 
 
 void distributedSurfaceTopologyBirth::validateControls() const
 {
-    if (Pstream::parRun())
-    {
-        FatalErrorInFunction
-            << typeName
-            << " is intentionally serial-only in the first capability "
-            << "checkpoint. MPI event ownership/decomposition invariance "
-            << "has not yet been qualified."
-            << exit(FatalError);
-    }
-
     if (patches_.empty())
     {
         FatalErrorInFunction
@@ -445,9 +440,19 @@ scalar distributedSurfaceTopologyBirth::random01
 (
     const label timeIndex,
     const label patchOrdinal,
-    const label facei
+    const vector& faceCentre
 ) const
 {
+    // Quantize geometry to 1 nm before hashing. This is many orders of
+    // magnitude finer than the capability mesh, while avoiding decomposition-
+    // dependent processor-local face numbering and tiny coordinate roundoff.
+    const std::int64_t qx =
+        static_cast<std::int64_t>(std::llround(faceCentre.x()*1.0e9));
+    const std::int64_t qy =
+        static_cast<std::int64_t>(std::llround(faceCentre.y()*1.0e9));
+    const std::int64_t qz =
+        static_cast<std::int64_t>(std::llround(faceCentre.z()*1.0e9));
+
     std::uint64_t x =
         static_cast<std::uint64_t>(static_cast<std::int64_t>(randomSeed_));
 
@@ -455,8 +460,12 @@ scalar distributedSurfaceTopologyBirth::random01
        * UINT64_C(0x9E3779B97F4A7C15);
     x ^= static_cast<std::uint64_t>(patchOrdinal + 1)
        * UINT64_C(0xBF58476D1CE4E5B9);
-    x ^= static_cast<std::uint64_t>(facei + 1)
+    x ^= static_cast<std::uint64_t>(qx)
        * UINT64_C(0x94D049BB133111EB);
+    x ^= static_cast<std::uint64_t>(qy)
+       * UINT64_C(0xD6E8FEB86659FD93);
+    x ^= static_cast<std::uint64_t>(qz)
+       * UINT64_C(0xA5A3564E27F8862D);
 
     x ^= x >> 30;
     x *= UINT64_C(0xBF58476D1CE4E5B9);
@@ -589,7 +598,15 @@ label distributedSurfaceTopologyBirth::spawnEvents
         return 0;
     }
 
-    label birthsThisStep = 0;
+    DynamicList<vector> candidateCentres;
+    DynamicList<vector> candidateNormals;
+    DynamicList<scalar> candidateRadii;
+    DynamicList<scalar> candidateSuperheats;
+    DynamicList<scalar> candidateHazards;
+    DynamicList<scalar> candidateProbabilities;
+    DynamicList<scalar> candidateExclusionRadii;
+    DynamicList<label> candidatePatchOrdinals;
+    DynamicList<label> candidateLocalFaces;
 
     forAll(patches_, patchOrdinal)
     {
@@ -628,11 +645,6 @@ label distributedSurfaceTopologyBirth::spawnEvents
 
             eligibleMask_[celli] = 1.0;
 
-            if (birthsThisStep >= maxBirthsPerStep_)
-            {
-                continue;
-            }
-
             const scalar normalizedExcess =
                 max
                 (
@@ -665,7 +677,7 @@ label distributedSurfaceTopologyBirth::spawnEvents
 
             if
             (
-                random01(timeIndex, patchOrdinal, facei)
+                random01(timeIndex, patchOrdinal, faceCentres[facei])
               >= eventProbability
             )
             {
@@ -685,64 +697,297 @@ label distributedSurfaceTopologyBirth::spawnEvents
                 max(faceArea, scalar(VSMALL));
             const vector inwardNormal =
                 -faceAreaVectors[facei]/faceAreaMag;
-
-            const scalar eventEnd =
-                timeValue + seedCreationDuration_;
             const scalar localExclusionRadius =
                 exclusionRadius_ > 0
               ? exclusionRadius_
               : exclusionRadiusFactor_*radius;
 
-            const label eventId = nextEventId_++;
+            candidateCentres.append(faceCentres[facei]);
+            candidateNormals.append(inwardNormal);
+            candidateRadii.append(radius);
+            candidateSuperheats.append(wallSuperheat);
+            candidateHazards.append(hazard);
+            candidateProbabilities.append(eventProbability);
+            candidateExclusionRadii.append(localExclusionRadius);
+            candidatePatchOrdinals.append(patchOrdinal);
+            candidateLocalFaces.append(facei);
+        }
+    }
 
-            eventCentres_.append(faceCentres[facei]);
-            eventNormals_.append(inwardNormal);
-            eventRadii_.append(radius);
-            eventEndTimes_.append(eventEnd);
-            eventIds_.append(eventId);
+    const List<vector> localCentres(candidateCentres);
+    const List<vector> localNormals(candidateNormals);
+    const List<scalar> localRadii(candidateRadii);
+    const List<scalar> localSuperheats(candidateSuperheats);
+    const List<scalar> localHazards(candidateHazards);
+    const List<scalar> localProbabilities(candidateProbabilities);
+    const List<scalar> localExclusionRadii(candidateExclusionRadii);
+    const List<label> localPatchOrdinals(candidatePatchOrdinals);
+    const List<label> localFaces(candidateLocalFaces);
 
-            const label stencilCells =
-                appendSeedStencil
-                (
-                    faceCentres[facei],
-                    inwardNormal,
-                    radius,
-                    eventEnd,
-                    eventId
-                );
+    const List<List<vector>> allCentres =
+        Pstream::listGatherValues(localCentres);
+    const List<List<vector>> allNormals =
+        Pstream::listGatherValues(localNormals);
+    const List<List<scalar>> allRadii =
+        Pstream::listGatherValues(localRadii);
+    const List<List<scalar>> allSuperheats =
+        Pstream::listGatherValues(localSuperheats);
+    const List<List<scalar>> allHazards =
+        Pstream::listGatherValues(localHazards);
+    const List<List<scalar>> allProbabilities =
+        Pstream::listGatherValues(localProbabilities);
+    const List<List<scalar>> allExclusionRadii =
+        Pstream::listGatherValues(localExclusionRadii);
+    const List<List<label>> allPatchOrdinals =
+        Pstream::listGatherValues(localPatchOrdinals);
+    const List<List<label>> allFaces =
+        Pstream::listGatherValues(localFaces);
 
-            if (stencilCells == 0)
+    List<vector> acceptedCentres;
+    List<vector> acceptedNormals;
+    List<scalar> acceptedRadii;
+    List<scalar> acceptedSuperheats;
+    List<scalar> acceptedHazards;
+    List<scalar> acceptedProbabilities;
+    List<scalar> acceptedExclusionRadii;
+    List<label> acceptedPatchOrdinals;
+    List<label> acceptedSourceProcs;
+    List<label> acceptedSourceFaces;
+    List<label> acceptedEventIds;
+
+    if (Pstream::master())
+    {
+        label totalCandidates = 0;
+        forAll(allCentres, proci)
+        {
+            totalCandidates += allCentres[proci].size();
+        }
+
+        List<vector> flatCentres(totalCandidates);
+        List<vector> flatNormals(totalCandidates);
+        List<scalar> flatRadii(totalCandidates);
+        List<scalar> flatSuperheats(totalCandidates);
+        List<scalar> flatHazards(totalCandidates);
+        List<scalar> flatProbabilities(totalCandidates);
+        List<scalar> flatExclusionRadii(totalCandidates);
+        List<label> flatPatchOrdinals(totalCandidates);
+        List<label> flatSourceProcs(totalCandidates);
+        List<label> flatSourceFaces(totalCandidates);
+        List<label> order(totalCandidates);
+
+        label flatI = 0;
+        forAll(allCentres, proci)
+        {
+            forAll(allCentres[proci], locali)
             {
-                FatalErrorInFunction
-                    << "Event " << eventId
-                    << " generated an empty seed stencil at "
-                    << faceCentres[facei]
-                    << exit(FatalError);
+                flatCentres[flatI] = allCentres[proci][locali];
+                flatNormals[flatI] = allNormals[proci][locali];
+                flatRadii[flatI] = allRadii[proci][locali];
+                flatSuperheats[flatI] = allSuperheats[proci][locali];
+                flatHazards[flatI] = allHazards[proci][locali];
+                flatProbabilities[flatI] = allProbabilities[proci][locali];
+                flatExclusionRadii[flatI] =
+                    allExclusionRadii[proci][locali];
+                flatPatchOrdinals[flatI] =
+                    allPatchOrdinals[proci][locali];
+                flatSourceProcs[flatI] = proci;
+                flatSourceFaces[flatI] = allFaces[proci][locali];
+                order[flatI] = flatI;
+                ++flatI;
+            }
+        }
+
+        // Stable physical ordering, independent of processor decomposition.
+        // The face-centre coordinates are unique on a given configured patch.
+        for (label i = 1; i < order.size(); ++i)
+        {
+            const label key = order[i];
+            label j = i - 1;
+
+            auto before = [&](const label a, const label b)
+            {
+                if (flatPatchOrdinals[a] != flatPatchOrdinals[b])
+                {
+                    return flatPatchOrdinals[a] < flatPatchOrdinals[b];
+                }
+
+                const vector& ca = flatCentres[a];
+                const vector& cb = flatCentres[b];
+
+                if (ca.x() != cb.x()) return ca.x() < cb.x();
+                if (ca.y() != cb.y()) return ca.y() < cb.y();
+                if (ca.z() != cb.z()) return ca.z() < cb.z();
+                if (flatSourceProcs[a] != flatSourceProcs[b])
+                {
+                    return flatSourceProcs[a] < flatSourceProcs[b];
+                }
+                return flatSourceFaces[a] < flatSourceFaces[b];
+            };
+
+            while (j >= 0 && before(key, order[j]))
+            {
+                order[j + 1] = order[j];
+                --j;
+            }
+            order[j + 1] = key;
+        }
+
+        acceptedCentres.resize(maxBirthsPerStep_);
+        acceptedNormals.resize(maxBirthsPerStep_);
+        acceptedRadii.resize(maxBirthsPerStep_);
+        acceptedSuperheats.resize(maxBirthsPerStep_);
+        acceptedHazards.resize(maxBirthsPerStep_);
+        acceptedProbabilities.resize(maxBirthsPerStep_);
+        acceptedExclusionRadii.resize(maxBirthsPerStep_);
+        acceptedPatchOrdinals.resize(maxBirthsPerStep_);
+        acceptedSourceProcs.resize(maxBirthsPerStep_);
+        acceptedSourceFaces.resize(maxBirthsPerStep_);
+        acceptedEventIds.resize(maxBirthsPerStep_);
+
+        label acceptedCount = 0;
+
+        forAll(order, orderI)
+        {
+            if (acceptedCount >= maxBirthsPerStep_)
+            {
+                break;
             }
 
-            recentCentres_.append(faceCentres[facei]);
-            recentExclusionRadii_.append(localExclusionRadius);
-            recentExpiryTimes_.append(eventEnd + cooldownTime_);
+            const label candidateI = order[orderI];
+            const vector& centre = flatCentres[candidateI];
 
-            ++birthsThisStep;
+            bool excluded = recentlyExcluded(centre, timeValue);
+
+            for
+            (
+                label acceptedI = 0;
+                !excluded && acceptedI < acceptedCount;
+                ++acceptedI
+            )
+            {
+                if
+                (
+                    magSqr(centre - acceptedCentres[acceptedI])
+                  < sqr(acceptedExclusionRadii[acceptedI])
+                )
+                {
+                    excluded = true;
+                }
+            }
+
+            if (excluded)
+            {
+                continue;
+            }
+
+            acceptedCentres[acceptedCount] = centre;
+            acceptedNormals[acceptedCount] = flatNormals[candidateI];
+            acceptedRadii[acceptedCount] = flatRadii[candidateI];
+            acceptedSuperheats[acceptedCount] = flatSuperheats[candidateI];
+            acceptedHazards[acceptedCount] = flatHazards[candidateI];
+            acceptedProbabilities[acceptedCount] =
+                flatProbabilities[candidateI];
+            acceptedExclusionRadii[acceptedCount] =
+                flatExclusionRadii[candidateI];
+            acceptedPatchOrdinals[acceptedCount] =
+                flatPatchOrdinals[candidateI];
+            acceptedSourceProcs[acceptedCount] =
+                flatSourceProcs[candidateI];
+            acceptedSourceFaces[acceptedCount] =
+                flatSourceFaces[candidateI];
+            acceptedEventIds[acceptedCount] = nextEventId_++;
+            ++acceptedCount;
+        }
+
+        acceptedCentres.resize(acceptedCount);
+        acceptedNormals.resize(acceptedCount);
+        acceptedRadii.resize(acceptedCount);
+        acceptedSuperheats.resize(acceptedCount);
+        acceptedHazards.resize(acceptedCount);
+        acceptedProbabilities.resize(acceptedCount);
+        acceptedExclusionRadii.resize(acceptedCount);
+        acceptedPatchOrdinals.resize(acceptedCount);
+        acceptedSourceProcs.resize(acceptedCount);
+        acceptedSourceFaces.resize(acceptedCount);
+        acceptedEventIds.resize(acceptedCount);
+    }
+
+    Pstream::broadcastList(acceptedCentres);
+    Pstream::broadcastList(acceptedNormals);
+    Pstream::broadcastList(acceptedRadii);
+    Pstream::broadcastList(acceptedSuperheats);
+    Pstream::broadcastList(acceptedHazards);
+    Pstream::broadcastList(acceptedProbabilities);
+    Pstream::broadcastList(acceptedExclusionRadii);
+    Pstream::broadcastList(acceptedPatchOrdinals);
+    Pstream::broadcastList(acceptedSourceProcs);
+    Pstream::broadcastList(acceptedSourceFaces);
+    Pstream::broadcastList(acceptedEventIds);
+
+    const scalar eventEnd = timeValue + seedCreationDuration_;
+
+    forAll(acceptedCentres, eventI)
+    {
+        const label eventId = acceptedEventIds[eventI];
+
+        if (!Pstream::master())
+        {
+            nextEventId_ = max(nextEventId_, eventId + 1);
+        }
+
+        eventCentres_.append(acceptedCentres[eventI]);
+        eventNormals_.append(acceptedNormals[eventI]);
+        eventRadii_.append(acceptedRadii[eventI]);
+        eventEndTimes_.append(eventEnd);
+        eventIds_.append(eventId);
+
+        label stencilCells =
+            appendSeedStencil
+            (
+                acceptedCentres[eventI],
+                acceptedNormals[eventI],
+                acceptedRadii[eventI],
+                eventEnd,
+                eventId
+            );
+
+        reduce(stencilCells, sumOp<label>());
+
+        if (stencilCells == 0)
+        {
+            FatalErrorInFunction
+                << "Event " << eventId
+                << " generated an empty global seed stencil at "
+                << acceptedCentres[eventI]
+                << exit(FatalError);
+        }
+
+        recentCentres_.append(acceptedCentres[eventI]);
+        recentExclusionRadii_.append(acceptedExclusionRadii[eventI]);
+        recentExpiryTimes_.append(eventEnd + cooldownTime_);
+
+        if (Pstream::master())
+        {
+            const label patchOrdinal = acceptedPatchOrdinals[eventI];
 
             Info<< "DSTB_EVENT"
                 << " eventId=" << eventId
                 << " time=" << timeValue
                 << " patch=" << patches_[patchOrdinal]
-                << " face=" << facei
-                << " centre=" << faceCentres[facei]
-                << " seedRadius=" << radius
+                << " face=" << acceptedSourceFaces[eventI]
+                << " sourceProc=" << acceptedSourceProcs[eventI]
+                << " centre=" << acceptedCentres[eventI]
+                << " seedRadius=" << acceptedRadii[eventI]
                 << " stencilCells=" << stencilCells
-                << " wallSuperheat=" << wallSuperheat
-                << " hazardRate=" << hazard
-                << " probability=" << eventProbability
+                << " wallSuperheat=" << acceptedSuperheats[eventI]
+                << " hazardRate=" << acceptedHazards[eventI]
+                << " probability=" << acceptedProbabilities[eventI]
                 << " couplingMode=" << sourceCouplingMode_
                 << endl;
         }
     }
 
-    return birthsThisStep;
+    return acceptedCentres.size();
 }
 
 
@@ -951,6 +1196,16 @@ void distributedSurfaceTopologyBirth::updateSources()
         maxAlphaRate
     );
 
+    // Convert local source integrals to global physical diagnostics. Each rank
+    // receives the same reduced values, so cumulative defect state stays
+    // identical across the decomposition.
+    reduce(integratedAlphaSource, sumOp<scalar>());
+    reduce(integratedMassSource, sumOp<scalar>());
+    reduce(integratedLatentSink, sumOp<scalar>());
+    reduce(integratedTopologyMassDefectRate, sumOp<scalar>());
+    reduce(integratedTopologyLatentDefectRate, sumOp<scalar>());
+    reduce(maxAlphaRate, maxOp<scalar>());
+
     const scalar deltaT = mesh.time().deltaTValue();
     const scalar topologyMassDefectThisStep =
         integratedTopologyMassDefectRate*deltaT;
@@ -978,36 +1233,42 @@ void distributedSurfaceTopologyBirth::updateSources()
         {
             eligibleCells += eligibleMask_[celli] > 0.5;
         }
+        reduce(eligibleCells, sumOp<label>());
 
-        Info<< "DSTB"
-            << " time=" << mesh.time().value()
-            << " couplingMode=" << sourceCouplingMode_
-            << " eligibleCells=" << eligibleCells
-            << " births=" << birthsThisStep
-            << " activeEvents="
-            << activeEventCount(mesh.time().value())
-            << " totalEvents=" << nextEventId_
-            << " integratedAlphaSource="
-            << integratedAlphaSource
-            << " integratedMassSource="
-            << integratedMassSource
-            << " integratedLatentSink="
-            << integratedLatentSink
-            << " integratedTopologyMassDefectRate="
-            << integratedTopologyMassDefectRate
-            << " integratedTopologyLatentDefectRate="
-            << integratedTopologyLatentDefectRate
-            << " topologyMassDefectThisStep="
-            << topologyMassDefectThisStep
-            << " topologyLatentDefectThisStep="
-            << topologyLatentDefectThisStep
-            << " cumulativeTopologyMassDefect="
-            << cumulativeTopologyMassDefect_
-            << " cumulativeTopologyLatentDefect="
-            << cumulativeTopologyLatentDefect_
-            << " maxAlphaRate=" << maxAlphaRate
-            << " maxWallSuperheat=" << gMax(superheat_)
-            << endl;
+        const auto maxWallSuperheat = gMax(superheat_);
+
+        if (Pstream::master())
+        {
+            Info<< "DSTB"
+                << " time=" << mesh.time().value()
+                << " couplingMode=" << sourceCouplingMode_
+                << " eligibleCells=" << eligibleCells
+                << " births=" << birthsThisStep
+                << " activeEvents="
+                << activeEventCount(mesh.time().value())
+                << " totalEvents=" << nextEventId_
+                << " integratedAlphaSource="
+                << integratedAlphaSource
+                << " integratedMassSource="
+                << integratedMassSource
+                << " integratedLatentSink="
+                << integratedLatentSink
+                << " integratedTopologyMassDefectRate="
+                << integratedTopologyMassDefectRate
+                << " integratedTopologyLatentDefectRate="
+                << integratedTopologyLatentDefectRate
+                << " topologyMassDefectThisStep="
+                << topologyMassDefectThisStep
+                << " topologyLatentDefectThisStep="
+                << topologyLatentDefectThisStep
+                << " cumulativeTopologyMassDefect="
+                << cumulativeTopologyMassDefect_
+                << " cumulativeTopologyLatentDefect="
+                << cumulativeTopologyLatentDefect_
+                << " maxAlphaRate=" << maxAlphaRate
+                << " maxWallSuperheat=" << maxWallSuperheat
+                << endl;
+        }
     }
 }
 
