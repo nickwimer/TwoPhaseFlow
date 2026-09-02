@@ -741,216 +741,183 @@ label distributedSurfaceTopologyBirth::spawnEvents
     const List<label> localPatchOrdinals(candidatePatchOrdinals);
     const List<label> localFaces(candidateLocalFaces);
 
+    // Candidate counts are tiny compared with the CFD state. Replicate the
+    // complete candidate lists to every rank and let every rank execute the
+    // same physical sort/exclusion/cap logic. This removes the previous
+    // master-only selection + eleven variable-length broadcasts and keeps
+    // accepted-event state identical by construction.
     const List<List<vector>> allCentres =
-        Pstream::listGatherValues(localCentres);
+        Pstream::allGatherValues(localCentres);
     const List<List<vector>> allNormals =
-        Pstream::listGatherValues(localNormals);
+        Pstream::allGatherValues(localNormals);
     const List<List<scalar>> allRadii =
-        Pstream::listGatherValues(localRadii);
+        Pstream::allGatherValues(localRadii);
     const List<List<scalar>> allSuperheats =
-        Pstream::listGatherValues(localSuperheats);
+        Pstream::allGatherValues(localSuperheats);
     const List<List<scalar>> allHazards =
-        Pstream::listGatherValues(localHazards);
+        Pstream::allGatherValues(localHazards);
     const List<List<scalar>> allProbabilities =
-        Pstream::listGatherValues(localProbabilities);
+        Pstream::allGatherValues(localProbabilities);
     const List<List<scalar>> allExclusionRadii =
-        Pstream::listGatherValues(localExclusionRadii);
+        Pstream::allGatherValues(localExclusionRadii);
     const List<List<label>> allPatchOrdinals =
-        Pstream::listGatherValues(localPatchOrdinals);
+        Pstream::allGatherValues(localPatchOrdinals);
     const List<List<label>> allFaces =
-        Pstream::listGatherValues(localFaces);
+        Pstream::allGatherValues(localFaces);
 
-    List<vector> acceptedCentres;
-    List<vector> acceptedNormals;
-    List<scalar> acceptedRadii;
-    List<scalar> acceptedSuperheats;
-    List<scalar> acceptedHazards;
-    List<scalar> acceptedProbabilities;
-    List<scalar> acceptedExclusionRadii;
-    List<label> acceptedPatchOrdinals;
-    List<label> acceptedSourceProcs;
-    List<label> acceptedSourceFaces;
-    List<label> acceptedEventIds;
-
-    if (Pstream::master())
+    label totalCandidates = 0;
+    forAll(allCentres, proci)
     {
-        label totalCandidates = 0;
-        forAll(allCentres, proci)
-        {
-            totalCandidates += allCentres[proci].size();
-        }
-
-        List<vector> flatCentres(totalCandidates);
-        List<vector> flatNormals(totalCandidates);
-        List<scalar> flatRadii(totalCandidates);
-        List<scalar> flatSuperheats(totalCandidates);
-        List<scalar> flatHazards(totalCandidates);
-        List<scalar> flatProbabilities(totalCandidates);
-        List<scalar> flatExclusionRadii(totalCandidates);
-        List<label> flatPatchOrdinals(totalCandidates);
-        List<label> flatSourceProcs(totalCandidates);
-        List<label> flatSourceFaces(totalCandidates);
-        List<label> order(totalCandidates);
-
-        label flatI = 0;
-        forAll(allCentres, proci)
-        {
-            forAll(allCentres[proci], locali)
-            {
-                flatCentres[flatI] = allCentres[proci][locali];
-                flatNormals[flatI] = allNormals[proci][locali];
-                flatRadii[flatI] = allRadii[proci][locali];
-                flatSuperheats[flatI] = allSuperheats[proci][locali];
-                flatHazards[flatI] = allHazards[proci][locali];
-                flatProbabilities[flatI] = allProbabilities[proci][locali];
-                flatExclusionRadii[flatI] =
-                    allExclusionRadii[proci][locali];
-                flatPatchOrdinals[flatI] =
-                    allPatchOrdinals[proci][locali];
-                flatSourceProcs[flatI] = proci;
-                flatSourceFaces[flatI] = allFaces[proci][locali];
-                order[flatI] = flatI;
-                ++flatI;
-            }
-        }
-
-        // Stable physical ordering, independent of processor decomposition.
-        // The face-centre coordinates are unique on a given configured patch.
-        for (label i = 1; i < order.size(); ++i)
-        {
-            const label key = order[i];
-            label j = i - 1;
-
-            auto before = [&](const label a, const label b)
-            {
-                if (flatPatchOrdinals[a] != flatPatchOrdinals[b])
-                {
-                    return flatPatchOrdinals[a] < flatPatchOrdinals[b];
-                }
-
-                const vector& ca = flatCentres[a];
-                const vector& cb = flatCentres[b];
-
-                if (ca.x() != cb.x()) return ca.x() < cb.x();
-                if (ca.y() != cb.y()) return ca.y() < cb.y();
-                if (ca.z() != cb.z()) return ca.z() < cb.z();
-                if (flatSourceProcs[a] != flatSourceProcs[b])
-                {
-                    return flatSourceProcs[a] < flatSourceProcs[b];
-                }
-                return flatSourceFaces[a] < flatSourceFaces[b];
-            };
-
-            while (j >= 0 && before(key, order[j]))
-            {
-                order[j + 1] = order[j];
-                --j;
-            }
-            order[j + 1] = key;
-        }
-
-        acceptedCentres.resize(maxBirthsPerStep_);
-        acceptedNormals.resize(maxBirthsPerStep_);
-        acceptedRadii.resize(maxBirthsPerStep_);
-        acceptedSuperheats.resize(maxBirthsPerStep_);
-        acceptedHazards.resize(maxBirthsPerStep_);
-        acceptedProbabilities.resize(maxBirthsPerStep_);
-        acceptedExclusionRadii.resize(maxBirthsPerStep_);
-        acceptedPatchOrdinals.resize(maxBirthsPerStep_);
-        acceptedSourceProcs.resize(maxBirthsPerStep_);
-        acceptedSourceFaces.resize(maxBirthsPerStep_);
-        acceptedEventIds.resize(maxBirthsPerStep_);
-
-        label acceptedCount = 0;
-
-        forAll(order, orderI)
-        {
-            if (acceptedCount >= maxBirthsPerStep_)
-            {
-                break;
-            }
-
-            const label candidateI = order[orderI];
-            const vector& centre = flatCentres[candidateI];
-
-            bool excluded = recentlyExcluded(centre, timeValue);
-
-            for
-            (
-                label acceptedI = 0;
-                !excluded && acceptedI < acceptedCount;
-                ++acceptedI
-            )
-            {
-                if
-                (
-                    magSqr(centre - acceptedCentres[acceptedI])
-                  < sqr(acceptedExclusionRadii[acceptedI])
-                )
-                {
-                    excluded = true;
-                }
-            }
-
-            if (excluded)
-            {
-                continue;
-            }
-
-            acceptedCentres[acceptedCount] = centre;
-            acceptedNormals[acceptedCount] = flatNormals[candidateI];
-            acceptedRadii[acceptedCount] = flatRadii[candidateI];
-            acceptedSuperheats[acceptedCount] = flatSuperheats[candidateI];
-            acceptedHazards[acceptedCount] = flatHazards[candidateI];
-            acceptedProbabilities[acceptedCount] =
-                flatProbabilities[candidateI];
-            acceptedExclusionRadii[acceptedCount] =
-                flatExclusionRadii[candidateI];
-            acceptedPatchOrdinals[acceptedCount] =
-                flatPatchOrdinals[candidateI];
-            acceptedSourceProcs[acceptedCount] =
-                flatSourceProcs[candidateI];
-            acceptedSourceFaces[acceptedCount] =
-                flatSourceFaces[candidateI];
-            acceptedEventIds[acceptedCount] = nextEventId_++;
-            ++acceptedCount;
-        }
-
-        acceptedCentres.resize(acceptedCount);
-        acceptedNormals.resize(acceptedCount);
-        acceptedRadii.resize(acceptedCount);
-        acceptedSuperheats.resize(acceptedCount);
-        acceptedHazards.resize(acceptedCount);
-        acceptedProbabilities.resize(acceptedCount);
-        acceptedExclusionRadii.resize(acceptedCount);
-        acceptedPatchOrdinals.resize(acceptedCount);
-        acceptedSourceProcs.resize(acceptedCount);
-        acceptedSourceFaces.resize(acceptedCount);
-        acceptedEventIds.resize(acceptedCount);
+        totalCandidates += allCentres[proci].size();
     }
 
-    Pstream::broadcastList(acceptedCentres);
-    Pstream::broadcastList(acceptedNormals);
-    Pstream::broadcastList(acceptedRadii);
-    Pstream::broadcastList(acceptedSuperheats);
-    Pstream::broadcastList(acceptedHazards);
-    Pstream::broadcastList(acceptedProbabilities);
-    Pstream::broadcastList(acceptedExclusionRadii);
-    Pstream::broadcastList(acceptedPatchOrdinals);
-    Pstream::broadcastList(acceptedSourceProcs);
-    Pstream::broadcastList(acceptedSourceFaces);
-    Pstream::broadcastList(acceptedEventIds);
+    List<vector> flatCentres(totalCandidates);
+    List<vector> flatNormals(totalCandidates);
+    List<scalar> flatRadii(totalCandidates);
+    List<scalar> flatSuperheats(totalCandidates);
+    List<scalar> flatHazards(totalCandidates);
+    List<scalar> flatProbabilities(totalCandidates);
+    List<scalar> flatExclusionRadii(totalCandidates);
+    List<label> flatPatchOrdinals(totalCandidates);
+    List<label> flatSourceProcs(totalCandidates);
+    List<label> flatSourceFaces(totalCandidates);
+    List<label> order(totalCandidates);
+
+    label flatI = 0;
+    forAll(allCentres, proci)
+    {
+        forAll(allCentres[proci], locali)
+        {
+            flatCentres[flatI] = allCentres[proci][locali];
+            flatNormals[flatI] = allNormals[proci][locali];
+            flatRadii[flatI] = allRadii[proci][locali];
+            flatSuperheats[flatI] = allSuperheats[proci][locali];
+            flatHazards[flatI] = allHazards[proci][locali];
+            flatProbabilities[flatI] = allProbabilities[proci][locali];
+            flatExclusionRadii[flatI] = allExclusionRadii[proci][locali];
+            flatPatchOrdinals[flatI] = allPatchOrdinals[proci][locali];
+            flatSourceProcs[flatI] = proci;
+            flatSourceFaces[flatI] = allFaces[proci][locali];
+            order[flatI] = flatI;
+            ++flatI;
+        }
+    }
+
+    // Stable physical ordering, independent of processor decomposition. The
+    // centre coordinates are unique on a configured physical patch, so
+    // sourceProc/sourceFace are diagnostic-only final tie breakers.
+    for (label i = 1; i < order.size(); ++i)
+    {
+        const label key = order[i];
+        label j = i - 1;
+
+        auto before = [&](const label a, const label b)
+        {
+            if (flatPatchOrdinals[a] != flatPatchOrdinals[b])
+            {
+                return flatPatchOrdinals[a] < flatPatchOrdinals[b];
+            }
+
+            const vector& ca = flatCentres[a];
+            const vector& cb = flatCentres[b];
+
+            if (ca.x() != cb.x()) return ca.x() < cb.x();
+            if (ca.y() != cb.y()) return ca.y() < cb.y();
+            if (ca.z() != cb.z()) return ca.z() < cb.z();
+            if (flatSourceProcs[a] != flatSourceProcs[b])
+            {
+                return flatSourceProcs[a] < flatSourceProcs[b];
+            }
+            return flatSourceFaces[a] < flatSourceFaces[b];
+        };
+
+        while (j >= 0 && before(key, order[j]))
+        {
+            order[j + 1] = order[j];
+            --j;
+        }
+        order[j + 1] = key;
+    }
+
+    List<vector> acceptedCentres(maxBirthsPerStep_);
+    List<vector> acceptedNormals(maxBirthsPerStep_);
+    List<scalar> acceptedRadii(maxBirthsPerStep_);
+    List<scalar> acceptedSuperheats(maxBirthsPerStep_);
+    List<scalar> acceptedHazards(maxBirthsPerStep_);
+    List<scalar> acceptedProbabilities(maxBirthsPerStep_);
+    List<scalar> acceptedExclusionRadii(maxBirthsPerStep_);
+    List<label> acceptedPatchOrdinals(maxBirthsPerStep_);
+    List<label> acceptedSourceProcs(maxBirthsPerStep_);
+    List<label> acceptedSourceFaces(maxBirthsPerStep_);
+    List<label> acceptedEventIds(maxBirthsPerStep_);
+
+    label acceptedCount = 0;
+
+    forAll(order, orderI)
+    {
+        if (acceptedCount >= maxBirthsPerStep_)
+        {
+            break;
+        }
+
+        const label candidateI = order[orderI];
+        const vector& centre = flatCentres[candidateI];
+
+        bool excluded = recentlyExcluded(centre, timeValue);
+
+        for
+        (
+            label acceptedI = 0;
+            !excluded && acceptedI < acceptedCount;
+            ++acceptedI
+        )
+        {
+            if
+            (
+                magSqr(centre - acceptedCentres[acceptedI])
+              < sqr(acceptedExclusionRadii[acceptedI])
+            )
+            {
+                excluded = true;
+            }
+        }
+
+        if (excluded)
+        {
+            continue;
+        }
+
+        acceptedCentres[acceptedCount] = centre;
+        acceptedNormals[acceptedCount] = flatNormals[candidateI];
+        acceptedRadii[acceptedCount] = flatRadii[candidateI];
+        acceptedSuperheats[acceptedCount] = flatSuperheats[candidateI];
+        acceptedHazards[acceptedCount] = flatHazards[candidateI];
+        acceptedProbabilities[acceptedCount] = flatProbabilities[candidateI];
+        acceptedExclusionRadii[acceptedCount] = flatExclusionRadii[candidateI];
+        acceptedPatchOrdinals[acceptedCount] = flatPatchOrdinals[candidateI];
+        acceptedSourceProcs[acceptedCount] = flatSourceProcs[candidateI];
+        acceptedSourceFaces[acceptedCount] = flatSourceFaces[candidateI];
+        acceptedEventIds[acceptedCount] = nextEventId_++;
+        ++acceptedCount;
+    }
+
+    acceptedCentres.resize(acceptedCount);
+    acceptedNormals.resize(acceptedCount);
+    acceptedRadii.resize(acceptedCount);
+    acceptedSuperheats.resize(acceptedCount);
+    acceptedHazards.resize(acceptedCount);
+    acceptedProbabilities.resize(acceptedCount);
+    acceptedExclusionRadii.resize(acceptedCount);
+    acceptedPatchOrdinals.resize(acceptedCount);
+    acceptedSourceProcs.resize(acceptedCount);
+    acceptedSourceFaces.resize(acceptedCount);
+    acceptedEventIds.resize(acceptedCount);
 
     const scalar eventEnd = timeValue + seedCreationDuration_;
 
     forAll(acceptedCentres, eventI)
     {
         const label eventId = acceptedEventIds[eventI];
-
-        if (!Pstream::master())
-        {
-            nextEventId_ = max(nextEventId_, eventId + 1);
-        }
 
         eventCentres_.append(acceptedCentres[eventI]);
         eventNormals_.append(acceptedNormals[eventI]);
@@ -1004,7 +971,7 @@ label distributedSurfaceTopologyBirth::spawnEvents
         }
     }
 
-    return acceptedCentres.size();
+    return acceptedCount;
 }
 
 
