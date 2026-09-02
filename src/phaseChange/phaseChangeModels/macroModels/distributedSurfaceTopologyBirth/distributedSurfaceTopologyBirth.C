@@ -453,6 +453,26 @@ scalar distributedSurfaceTopologyBirth::random01
     const std::int64_t qz =
         static_cast<std::int64_t>(std::llround(faceCentre.z()*1.0e9));
 
+    // Zig-zag signed coordinates before combining them. Directly converting
+    // two's-complement signed coordinates to uint64_t and XORing the terms
+    // gives exact inversion symmetry for opposite heater locations.
+    const auto signedCoordinateKey = [](const std::int64_t q)
+    {
+        const std::uint64_t magnitude =
+            q >= 0
+          ? static_cast<std::uint64_t>(q)
+          : static_cast<std::uint64_t>(-(q + 1)) + UINT64_C(1);
+
+        return
+            q >= 0
+          ? (magnitude << 1)
+          : ((magnitude << 1) - UINT64_C(1));
+    };
+
+    const std::uint64_t kx = signedCoordinateKey(qx);
+    const std::uint64_t ky = signedCoordinateKey(qy);
+    const std::uint64_t kz = signedCoordinateKey(qz);
+
     std::uint64_t x =
         static_cast<std::uint64_t>(static_cast<std::int64_t>(randomSeed_));
 
@@ -460,12 +480,9 @@ scalar distributedSurfaceTopologyBirth::random01
        * UINT64_C(0x9E3779B97F4A7C15);
     x ^= static_cast<std::uint64_t>(patchOrdinal + 1)
        * UINT64_C(0xBF58476D1CE4E5B9);
-    x ^= static_cast<std::uint64_t>(qx)
-       * UINT64_C(0x94D049BB133111EB);
-    x ^= static_cast<std::uint64_t>(qy)
-       * UINT64_C(0xD6E8FEB86659FD93);
-    x ^= static_cast<std::uint64_t>(qz)
-       * UINT64_C(0xA5A3564E27F8862D);
+    x ^= kx * UINT64_C(0x94D049BB133111EB);
+    x ^= ky * UINT64_C(0xD6E8FEB86659FD93);
+    x ^= kz * UINT64_C(0xA5A3564E27F8862D);
 
     x ^= x >> 30;
     x *= UINT64_C(0xBF58476D1CE4E5B9);
