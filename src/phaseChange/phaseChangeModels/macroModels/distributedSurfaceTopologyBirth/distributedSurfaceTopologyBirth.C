@@ -627,6 +627,15 @@ label distributedSurfaceTopologyBirth::refreshPersistentExclusions
 
     forAll(recentCentres_, eventI)
     {
+        // Vapor-persistence exclusion is a one-shot lifecycle for each
+        // accepted event. Once that event has rewetted, later unrelated vapor
+        // entering its historical handoff stencil must not re-arm the old
+        // exclusion.
+        if (!recentPersistenceActive_[eventI])
+        {
+            continue;
+        }
+
         const bool forcingActive =
             eventI < eventEndTimes_.size()
          && eventEndTimes_[eventI] + SMALL >= timeValue;
@@ -634,11 +643,10 @@ label distributedSurfaceTopologyBirth::refreshPersistentExclusions
 
         if (forcingActive || hasVapor)
         {
-            recentPersistenceActive_[eventI] = 1;
             recentExpiryTimes_[eventI] = GREAT;
             ++persistentCount;
         }
-        else if (recentPersistenceActive_[eventI])
+        else
         {
             recentPersistenceActive_[eventI] = 0;
             recentExpiryTimes_[eventI] = timeValue + cooldownTime_;
