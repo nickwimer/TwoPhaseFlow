@@ -43,6 +43,8 @@ private:
     scalar exclusionRadius_;
     scalar exclusionRadiusFactor_;
     scalar cooldownTime_;
+    Switch vaporPersistenceExclusion_;
+    scalar rewetLiquidFraction_;
 
     label maxBirthsPerStep_;
     label randomSeed_;
@@ -75,6 +77,7 @@ private:
     DynamicList<vector> recentCentres_;
     DynamicList<scalar> recentExclusionRadii_;
     DynamicList<scalar> recentExpiryTimes_;
+    DynamicList<label> recentPersistenceActive_;
 
     volScalarField superheat_;
     volScalarField eligibleMask_;
@@ -103,6 +106,12 @@ private:
         const vector& faceCentre,
         const scalar timeValue
     ) const;
+
+    // When enabled, keep each accepted event's exclusion footprint active
+    // while its original topology-handoff stencil still contains vapor. Once
+    // that footprint rewets, start the ordinary cooldown timer. Returns the
+    // number of event exclusions currently being held by forcing or vapor.
+    label refreshPersistentExclusions(const scalar timeValue);
 
     label activeEventCount(const scalar timeValue) const;
 
