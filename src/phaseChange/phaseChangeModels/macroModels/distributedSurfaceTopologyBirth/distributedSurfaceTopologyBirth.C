@@ -113,6 +113,22 @@ distributedSurfaceTopologyBirth::distributedSurfaceTopologyBirth
     (
         modelDict().lookupOrDefault<scalar>("cooldownTime", 0.0)
     ),
+    vaporPersistenceExclusion_
+    (
+        modelDict().lookupOrDefault<Switch>
+        (
+            "vaporPersistenceExclusion",
+            false
+        )
+    ),
+    rewetLiquidFraction_
+    (
+        modelDict().lookupOrDefault<scalar>
+        (
+            "rewetLiquidFraction",
+            minimumLiquidFraction_
+        )
+    ),
     maxBirthsPerStep_
     (
         modelDict().lookupOrDefault<label>("maxBirthsPerStep", 4)
@@ -145,6 +161,7 @@ distributedSurfaceTopologyBirth::distributedSurfaceTopologyBirth
     recentCentres_(),
     recentExclusionRadii_(),
     recentExpiryTimes_(),
+    recentPersistenceActive_(),
     superheat_
     (
         IOobject
@@ -269,6 +286,9 @@ distributedSurfaceTopologyBirth::distributedSurfaceTopologyBirth
             << ", seedCreationDuration=" << seedCreationDuration_ << " s"
             << ", targetSeedVaporFraction=" << targetSeedVaporFraction_
             << ", sourceCouplingMode=" << sourceCouplingMode_
+            << ", vaporPersistenceExclusion="
+            << vaporPersistenceExclusion_
+            << ", rewetLiquidFraction=" << rewetLiquidFraction_
             << ", parallel=" << Pstream::parRun()
             << endl;
     }
@@ -421,6 +441,17 @@ void distributedSurfaceTopologyBirth::validateControls() const
             << exit(FatalError);
     }
 
+    if
+    (
+        rewetLiquidFraction_ < 0
+     || rewetLiquidFraction_ > 1
+    )
+    {
+        FatalErrorInFunction
+            << "rewetLiquidFraction must be in [0,1]."
+            << exit(FatalError);
+    }
+
     if (maxBirthsPerStep_ < 1)
     {
         FatalErrorInFunction
@@ -515,6 +546,117 @@ bool distributedSurfaceTopologyBirth::recentlyExcluded
     }
 
     return false;
+}
+
+
+label distributedSurfaceTopologyBirth::refreshPersistentExclusions
+(
+    const scalar timeValue
+)
+{
+    if (!vaporPersistenceExclusion_ || recentCentres_.empty())
+    {
+        return 0;
+    }
+
+    // Event IDs are allocated monotonically from zero. Build an explicit map
+    // instead of relying on that ordering so this scan stays robust if event
+    // storage changes later.
+    List<label> eventIndex(nextEventId_, -1);
+    forAll(eventIds_, eventI)
+    {
+        const label eventId = eventIds_[eventI];
+        if (eventId >= 0 && eventId < eventIndex.size())
+        {
+            eventIndex[eventId] = eventI;
+        }
+    }
+
+    List<label> localHasVapor(recentCentres_.size(), 0);
+    forAll(seedCellLabels_, stencilI)
+    {
+        const label eventId = seedCellEventIds_[stencilI];
+        if (eventId < 0 || eventId >= eventIndex.size())
+        {
+            continue;
+        }
+
+        const label eventI = eventIndex[eventId];
+        if (eventI < 0 || eventI >= localHasVapor.size())
+        {
+            continue;
+        }
+
+        const label celli = seedCellLabels_[stencilI];
+        if (phase1_[celli] < rewetLiquidFraction_)
+        {
+            localHasVapor[eventI] = 1;
+        }
+    }
+
+    List<label> globalHasVapor(localHasVapor);
+
+    if (Pstream::parRun())
+    {
+        const label myProc = Pstream::myProcNo();
+        const label nProcs = Pstream::nProcs();
+        List<List<label>> allHasVapor(nProcs);
+        allHasVapor[myProc] = localHasVapor;
+        Pstream::allGatherList(allHasVapor);
+
+        forAll(globalHasVapor, eventI)
+        {
+            globalHasVapor[eventI] = 0;
+
+            forAll(allHasVapor, proci)
+            {
+                if
+                (
+                    eventI < allHasVapor[proci].size()
+                 && allHasVapor[proci][eventI]
+                )
+                {
+                    globalHasVapor[eventI] = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    label persistentCount = 0;
+
+    forAll(recentCentres_, eventI)
+    {
+        const bool forcingActive =
+            eventI < eventEndTimes_.size()
+         && eventEndTimes_[eventI] + SMALL >= timeValue;
+        const bool hasVapor = globalHasVapor[eventI] != 0;
+
+        if (forcingActive || hasVapor)
+        {
+            recentPersistenceActive_[eventI] = 1;
+            recentExpiryTimes_[eventI] = GREAT;
+            ++persistentCount;
+        }
+        else if (recentPersistenceActive_[eventI])
+        {
+            recentPersistenceActive_[eventI] = 0;
+            recentExpiryTimes_[eventI] = timeValue + cooldownTime_;
+
+            if (Pstream::master())
+            {
+                Info<< "DSTB_REWET"
+                    << " eventId=" << eventIds_[eventI]
+                    << " time=" << timeValue
+                    << " centre=" << recentCentres_[eventI]
+                    << " cooldownUntil=" << recentExpiryTimes_[eventI]
+                    << " rewetLiquidFraction=" << rewetLiquidFraction_
+                    << endl;
+            }
+        }
+    }
+
+    return persistentCount;
 }
 
 
@@ -964,7 +1106,16 @@ label distributedSurfaceTopologyBirth::spawnEvents
 
         recentCentres_.append(acceptedCentres[eventI]);
         recentExclusionRadii_.append(acceptedExclusionRadii[eventI]);
-        recentExpiryTimes_.append(eventEnd + cooldownTime_);
+        recentExpiryTimes_.append
+        (
+            vaporPersistenceExclusion_
+          ? GREAT
+          : eventEnd + cooldownTime_
+        );
+        recentPersistenceActive_.append
+        (
+            vaporPersistenceExclusion_ ? 1 : 0
+        );
 
         if (Pstream::master())
         {
@@ -983,6 +1134,8 @@ label distributedSurfaceTopologyBirth::spawnEvents
                 << " hazardRate=" << acceptedHazards[eventI]
                 << " probability=" << acceptedProbabilities[eventI]
                 << " couplingMode=" << sourceCouplingMode_
+                << " vaporPersistenceExclusion="
+                << vaporPersistenceExclusion_
                 << endl;
         }
     }
@@ -1173,6 +1326,9 @@ void distributedSurfaceTopologyBirth::updateSources()
     const volScalarField& liquidCp =
         tLiquidCp();
 
+    const label persistentExclusions =
+        refreshPersistentExclusions(mesh.time().value());
+
     const label birthsThisStep =
         spawnEvents(liquidTemperature);
 
@@ -1246,6 +1402,7 @@ void distributedSurfaceTopologyBirth::updateSources()
                 << " births=" << birthsThisStep
                 << " activeEvents="
                 << activeEventCount(mesh.time().value())
+                << " persistentExclusions=" << persistentExclusions
                 << " totalEvents=" << nextEventId_
                 << " integratedAlphaSource="
                 << integratedAlphaSource
