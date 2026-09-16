@@ -151,6 +151,10 @@ public:
 
     // Member Functions
 
+        //- Optional momentum source. Most macro models do not alter momentum.
+        virtual void momentumSource(fvVectorMatrix& UEqn)
+        {}
+
         virtual void TSource1(fvScalarMatrix& T1Eqn) = 0;
 
         virtual void TSource2(fvScalarMatrix& T2Eqn) = 0;
