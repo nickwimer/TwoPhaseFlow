@@ -118,6 +118,8 @@ public:
     virtual ~fixedSiteDetachedBubbleBirth()
     {}
 
+    virtual void momentumSource(fvVectorMatrix& UEqn);
+
     virtual void TSource1(fvScalarMatrix& T1Eqn);
     virtual void TSource2(fvScalarMatrix& T2Eqn);
 
