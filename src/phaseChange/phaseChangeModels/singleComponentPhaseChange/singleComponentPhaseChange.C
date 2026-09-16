@@ -234,6 +234,18 @@ Foam::singleComponentPhaseChange::~singleComponentPhaseChange()
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
+void Foam::singleComponentPhaseChange::momentumSource
+(
+    fvVectorMatrix& UEqn
+)
+{
+    for (auto& mModel: macroModels_)
+    {
+        mModel.momentumSource(UEqn);
+    }
+}
+
+
 void Foam::singleComponentPhaseChange::correct()
 {
     surf_.reconstruct(false);
