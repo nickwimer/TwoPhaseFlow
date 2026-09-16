@@ -153,6 +153,13 @@ Foam::singleComponentPhaseChange::singleComponentPhaseChange
     Info << "creating singleComponentSatProp Model" << endl;
     satProp_ =  singleComponentSatProp::New(mesh_,satPropertiesDict);
 
+    // Saturation-property fields are constructed as zero fields and are
+    // populated by correct().  Initialize them before constructing energy,
+    // macro, or mass-source models so constructor-time model setup can safely
+    // query TSat, pSat, and latent heat.  Later runtime updates continue to use
+    // correctSatProperties() in the normal solver loop.
+    satProp_->correct(p_, phase1_.thermo().T());
+
     Info << "creating Energy Source Term Model" << endl;
     energyModel_ =  energySourceTermModel::New
     (
