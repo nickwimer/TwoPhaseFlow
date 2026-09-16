@@ -46,6 +46,7 @@ SourceFiles
 #include "compressibleInterPhaseTransportModel.H"
 
 #include "fvScalarMatrix.H"
+#include "fvMatricesFwd.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -145,6 +146,9 @@ public:
     }
 
     void correct();
+
+    //- Add optional macro-model momentum sources to the assembled U equation.
+    void momentumSource(fvVectorMatrix& UEqn);
 
     // void correct( const surfaceScalarField& kappa1,const surfaceScalarField& kappa2);
     //- Update properties
