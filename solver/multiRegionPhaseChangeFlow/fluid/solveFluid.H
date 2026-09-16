@@ -85,6 +85,13 @@ if (finalIter)
     #include "YEqns.H"
 
     #include "UEqn.H"
+
+    // Optional macro-model momentum sources are added after the U-equation
+    // coefficients have been assembled/relaxed and before pEqn forms HbyA
+    // from UEqn.H(). The pressure correction therefore remains responsible
+    // for producing the final pressure-consistent velocity/flux field.
+    phaseChange.momentumSource(UEqn);
+
     #include "TEqn.H"
 
     phaseChange.correct();
