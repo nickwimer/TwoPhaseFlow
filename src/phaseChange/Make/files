@@ -22,4 +22,9 @@ phaseChangeModels/macroModels/fixedSiteDetachedBubbleBirth/fixedSiteDetachedBubb
 
 phaseChangeModels/singleComponentPhaseChange/singleComponentPhaseChange.C
 
-saturationProperties/singleComponentPhaseChange/newSingleComponentSatProp.C
+saturationProperties/singleComponentSatProp/newSingleComponentSatProp.C
+saturationProperties/singleComponentSatProp/singleComponentSatProp.C
+saturationProperties/singleComponentSatProp/ClausiusClapeyron/ClausiusClapeyron.C
+saturationProperties/singleComponentSatProp/singleComponentFunction/singleComponentFunction.C
+
+LIB = $(FOAM_USER_LIBBIN)/libphaseChange
