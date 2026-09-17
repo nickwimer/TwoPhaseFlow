@@ -720,11 +720,28 @@ void Foam::fixedSiteDetachedBubbleBirth::updateSources()
             reduce(localRemainingVolume, sumOp<scalar>());
             reduce(localRequestedEnergy, sumOp<scalar>());
 
-            if
+            const scalar volumeTolerance = max
             (
-                localRemainingVolume
-             <= max(SMALL, 1.0e-6*targetVaporVolume_[siteI])
-            )
+                SMALL,
+                1.0e-6*targetVaporVolume_[siteI]
+            );
+            const scalar energyTolerance = max
+            (
+                SMALL,
+                1.0e-6*targetLatentEnergy_[siteI]
+            );
+            const scalar remainingLatentBudget = max
+            (
+                targetLatentEnergy_[siteI]
+              - consumedLatentEnergy_[siteI],
+                scalar(0)
+            );
+            const bool stencilComplete =
+                localRemainingVolume <= volumeTolerance;
+            const bool latentBudgetComplete =
+                remainingLatentBudget <= energyTolerance;
+
+            if (stencilComplete || latentBudgetComplete)
             {
                 siteState_[siteI] = WAITING_FOR_CLEARANCE;
                 releaseTime_[siteI] = timeValue;
@@ -736,17 +753,21 @@ void Foam::fixedSiteDetachedBubbleBirth::updateSources()
                         << " time=" << timeValue
                         << " centre=" << siteCentres_[siteI]
                         << " departureRadius=" << departureRadius_
+                        << " completion="
+                        << (latentBudgetComplete ? "latentBudget" : "stencil")
                         << " createdVaporVolume="
                         << createdVaporVolume_[siteI]
                         << " createdVaporMass=" << createdVaporMass_[siteI]
                         << " consumedLatentEnergy="
                         << consumedLatentEnergy_[siteI]
+                        << " targetLatentEnergy="
+                        << targetLatentEnergy_[siteI]
                         << endl;
                 }
             }
             else
             {
-                const scalar energyScale =
+                const scalar availableEnergyScale =
                     localRequestedEnergy > SMALL
                   ? min
                     (
@@ -754,6 +775,19 @@ void Foam::fixedSiteDetachedBubbleBirth::updateSources()
                         storedEnergy_[siteI]/localRequestedEnergy
                     )
                   : scalar(0);
+                const scalar budgetEnergyScale =
+                    localRequestedEnergy > SMALL
+                  ? min
+                    (
+                        scalar(1),
+                        remainingLatentBudget/localRequestedEnergy
+                    )
+                  : scalar(0);
+                const scalar energyScale = min
+                (
+                    availableEnergyScale,
+                    budgetEnergyScale
+                );
 
                 scalar localCreatedVolume = 0;
                 scalar localCreatedMass = 0;
@@ -803,12 +837,30 @@ void Foam::fixedSiteDetachedBubbleBirth::updateSources()
                     scalar(0)
                 );
 
-                if (creationStep_[siteI] >= maximumCreationSteps_)
+                const scalar postSourceRemainingLatentBudget = max
+                (
+                    targetLatentEnergy_[siteI]
+                  - consumedLatentEnergy_[siteI],
+                    scalar(0)
+                );
+                if
+                (
+                    creationStep_[siteI] >= maximumCreationSteps_
+                 && postSourceRemainingLatentBudget > energyTolerance
+                )
                 {
                     FatalErrorInFunction
                         << "Site " << siteI
                         << " failed to create its detached bubble after "
                         << creationStep_[siteI] << " source updates"
+                        << "; remainingVolume=" << localRemainingVolume
+                        << "; createdVolume=" << createdVaporVolume_[siteI]
+                        << "; consumedLatentEnergy="
+                        << consumedLatentEnergy_[siteI]
+                        << "; targetLatentEnergy="
+                        << targetLatentEnergy_[siteI]
+                        << "; remainingLatentBudget="
+                        << postSourceRemainingLatentBudget
                         << exit(FatalError);
                 }
             }
