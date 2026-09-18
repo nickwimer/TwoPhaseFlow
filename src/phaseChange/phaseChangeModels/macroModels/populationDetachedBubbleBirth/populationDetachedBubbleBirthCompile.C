@@ -53,7 +53,7 @@ inline void populationSiteStencilReduceDiagnostic
 
 #define reduce(value, operation)                                             \
     (Foam::reduce((value), (operation)),                                     \
-     fixedSiteStencilReduceDiagnostic(#value, (value)))
+     populationSiteStencilReduceDiagnostic(#value, (value)))
 
 extern "C++"
 {
