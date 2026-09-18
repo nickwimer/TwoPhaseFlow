@@ -46,6 +46,12 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     ),
     patch_(modelDict().get<word>("patch")),
     siteCentres_(modelDict().lookup("siteCentres")),
+    energyOwnershipMode_
+    (
+        modelDict().lookupOrDefault<word>("energyOwnershipMode", "captureRadius")
+    ),
+    energyOwnershipCentres_(),
+    siteOwnershipIds_(),
     TSatValue_(modelDict().lookupOrDefault<scalar>("Tsat", -1)),
     siteActivationSuperheat_
     (
@@ -227,6 +233,14 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
         "zeroGradient"
     )
 {
+    if (energyOwnershipMode_ == "persistentVoronoi")
+    {
+        energyOwnershipCentres_ =
+            List<vector>(modelDict().lookup("energyOwnershipCentres"));
+        siteOwnershipIds_ =
+            labelList(modelDict().lookup("siteOwnershipIds"));
+    }
+
     validateControls();
     buildSiteStencils();
 
@@ -254,6 +268,8 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
             << ", departureRadius=" << departureRadius_
             << ", detachmentGap=" << detachmentGap_
             << ", captureRadius=" << captureRadius_
+            << ", energyOwnershipMode=" << energyOwnershipMode_
+            << ", ownershipCandidates=" << energyOwnershipCentres_.size()
             << ", activationThresholds=" << siteActivationSuperheat_.size()
             << ", targetVaporFraction=" << targetVaporFraction_
             << ", continuitySourceMode=" << continuitySourceMode_
@@ -269,6 +285,68 @@ void Foam::populationDetachedBubbleBirth::validateControls() const
         FatalErrorInFunction
             << "siteCentres must contain at least one physical site"
             << exit(FatalError);
+    }
+    if
+    (
+        energyOwnershipMode_ != "captureRadius"
+     && energyOwnershipMode_ != "persistentVoronoi"
+    )
+    {
+        FatalErrorInFunction
+            << "energyOwnershipMode must be captureRadius or persistentVoronoi; found "
+            << energyOwnershipMode_
+            << exit(FatalError);
+    }
+    if (energyOwnershipMode_ == "persistentVoronoi")
+    {
+        if (energyOwnershipCentres_.empty())
+        {
+            FatalErrorInFunction
+                << "persistentVoronoi requires non-empty energyOwnershipCentres"
+                << exit(FatalError);
+        }
+        if (siteOwnershipIds_.size() != siteCentres_.size())
+        {
+            FatalErrorInFunction
+                << "siteOwnershipIds must contain exactly one persistent owner "
+                << "index per siteCentre; sites=" << siteCentres_.size()
+                << ", ownershipIds=" << siteOwnershipIds_.size()
+                << exit(FatalError);
+        }
+        forAll(siteOwnershipIds_, siteI)
+        {
+            const label ownerI = siteOwnershipIds_[siteI];
+            if (ownerI < 0 || ownerI >= energyOwnershipCentres_.size())
+            {
+                FatalErrorInFunction
+                    << "siteOwnershipIds[" << siteI << "]=" << ownerI
+                    << " is outside energyOwnershipCentres range [0,"
+                    << energyOwnershipCentres_.size() - 1 << "]"
+                    << exit(FatalError);
+            }
+            if
+            (
+                mag(siteCentres_[siteI] - energyOwnershipCentres_[ownerI])
+              > 1.0e-9
+            )
+            {
+                FatalErrorInFunction
+                    << "siteCentre " << siteI << "=" << siteCentres_[siteI]
+                    << " does not match mapped persistent ownership centre "
+                    << ownerI << "=" << energyOwnershipCentres_[ownerI]
+                    << exit(FatalError);
+            }
+            for (label otherI = siteI + 1; otherI < siteOwnershipIds_.size(); ++otherI)
+            {
+                if (siteOwnershipIds_[otherI] == ownerI)
+                {
+                    FatalErrorInFunction
+                        << "persistent ownership index " << ownerI
+                        << " is mapped to more than one active site"
+                        << exit(FatalError);
+                }
+            }
+        }
     }
     if (siteActivationSuperheat_.size() != siteCentres_.size())
     {
@@ -406,6 +484,28 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
     const vectorField& faceCentres = patch.Cf();
     const vectorField& faceAreaVectors = patch.Sf();
 
+    labelList faceOwnership(faceCentres.size(), -1);
+    if (energyOwnershipMode_ == "persistentVoronoi")
+    {
+        forAll(faceCentres, faceI)
+        {
+            scalar nearestDistanceSqr = GREAT;
+            label nearestOwner = -1;
+            forAll(energyOwnershipCentres_, ownerI)
+            {
+                const vector d =
+                    faceCentres[faceI] - energyOwnershipCentres_[ownerI];
+                const scalar radialDistanceSqr = sqr(d.x()) + sqr(d.y());
+                if (radialDistanceSqr < nearestDistanceSqr)
+                {
+                    nearestDistanceSqr = radialDistanceSqr;
+                    nearestOwner = ownerI;
+                }
+            }
+            faceOwnership[faceI] = nearestOwner;
+        }
+    }
+
     tmp<volScalarField> tRhoV = phase2_.thermo().rho();
     const volScalarField& rhoV = tRhoV();
 
@@ -426,9 +526,21 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
         scalar localCaptureArea = 0;
         forAll(faceCentres, faceI)
         {
-            const vector d = faceCentres[faceI] - site;
-            const scalar radial = Foam::sqrt(sqr(d.x()) + sqr(d.y()));
-            if (radial <= captureRadius_ + SMALL)
+            bool ownsFace = false;
+            if (energyOwnershipMode_ == "persistentVoronoi")
+            {
+                ownsFace =
+                    faceOwnership[faceI] == siteOwnershipIds_[siteI];
+            }
+            else
+            {
+                const vector d = faceCentres[faceI] - site;
+                const scalar radial =
+                    Foam::sqrt(sqr(d.x()) + sqr(d.y()));
+                ownsFace = radial <= captureRadius_ + SMALL;
+            }
+
+            if (ownsFace)
             {
                 localFaces.append(faceI);
                 localCaptureArea += mag(faceAreaVectors[faceI]);
@@ -437,6 +549,20 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
         siteFaceLabels_[siteI].transfer(localFaces);
         reduce(localCaptureArea, sumOp<scalar>());
         captureArea_[siteI] = localCaptureArea;
+
+        if
+        (
+            energyOwnershipMode_ == "persistentVoronoi"
+         && Pstream::master()
+        )
+        {
+            Info<< "POPULATION_ENERGY_OWNERSHIP"
+                << " site=" << siteI
+                << " persistentSite=" << siteOwnershipIds_[siteI]
+                << " centre=" << site
+                << " area=" << captureArea_[siteI]
+                << endl;
+        }
 
         const vector bubbleCentre =
             site + vector(0, 0, departureRadius_ + detachmentGap_);

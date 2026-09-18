@@ -25,6 +25,10 @@ private:
     word patch_;
     List<vector> siteCentres_;
 
+    word energyOwnershipMode_;
+    List<vector> energyOwnershipCentres_;
+    labelList siteOwnershipIds_;
+
     scalar TSatValue_;
     scalarField siteActivationSuperheat_;
     scalar activationPersistence_;
