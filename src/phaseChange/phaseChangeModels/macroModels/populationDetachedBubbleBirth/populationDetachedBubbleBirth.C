@@ -89,6 +89,14 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     (
         modelDict().lookupOrDefault<scalar>("maxAlphaVaporPerStep", 0.03)
     ),
+    maxPreexistingHandoffVaporFraction_
+    (
+        modelDict().lookupOrDefault<scalar>
+        (
+            "maxPreexistingHandoffVaporFraction",
+            1.0
+        )
+    ),
     creationSteps_(modelDict().lookupOrDefault<label>("creationSteps", 30)),
     maximumCreationSteps_
     (
@@ -272,6 +280,8 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
             << ", ownershipCandidates=" << energyOwnershipCentres_.size()
             << ", activationThresholds=" << siteActivationSuperheat_.size()
             << ", targetVaporFraction=" << targetVaporFraction_
+            << ", maxPreexistingHandoffVaporFraction="
+            << maxPreexistingHandoffVaporFraction_
             << ", continuitySourceMode=" << continuitySourceMode_
             << ", parallel=" << Pstream::parRun()
             << endl;
@@ -402,6 +412,16 @@ void Foam::populationDetachedBubbleBirth::validateControls() const
     {
         FatalErrorInFunction
             << "maxAlphaVaporPerStep must be in (0,1]"
+            << exit(FatalError);
+    }
+    if
+    (
+        maxPreexistingHandoffVaporFraction_ < 0
+     || maxPreexistingHandoffVaporFraction_ > 1
+    )
+    {
+        FatalErrorInFunction
+            << "maxPreexistingHandoffVaporFraction must be in [0,1]"
             << exit(FatalError);
     }
     if (creationSteps_ < 1 || maximumCreationSteps_ < creationSteps_)
@@ -759,10 +779,18 @@ void Foam::populationDetachedBubbleBirth::updateSources()
             localShieldVapor + SMALL >= shieldingAlphaVaporThreshold_;
 
         scalar localSensibleEnergy = 0;
+        scalar localHandoffVaporVolume = 0;
         const labelList& releaseCells = sphereCells_[siteI];
         forAll(releaseCells, releaseI)
         {
             const label celli = releaseCells[releaseI];
+            const scalar target = sphereTargetVapor_[siteI][releaseI];
+            const scalar alphaLiquid =
+                max(min(phase1_[celli], scalar(1)), scalar(0));
+            const scalar alphaVapor = scalar(1) - alphaLiquid;
+            localHandoffVaporVolume +=
+                min(alphaVapor, target)*mesh.V()[celli];
+
             localSensibleEnergy +=
                 sensibleReserveFraction_
                *phase1_[celli]
@@ -772,6 +800,15 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                *max(liquidTemperature[celli] - TSat(celli), scalar(0));
         }
         reduce(localSensibleEnergy, sumOp<scalar>());
+        reduce(localHandoffVaporVolume, sumOp<scalar>());
+        const scalar handoffVaporFraction =
+            targetVaporVolume_[siteI] > SMALL
+          ? min
+            (
+                localHandoffVaporVolume/targetVaporVolume_[siteI],
+                scalar(1)
+            )
+          : scalar(0);
 
         const label oldState = siteState_[siteI];
 
@@ -818,8 +855,45 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                  >= targetLatentEnergy_[siteI]
                 )
                 {
-                    siteState_[siteI] = CREATING_DETACHED_BUBBLE;
-                    creationStep_[siteI] = 0;
+                    storedEnergy_[siteI] = min
+                    (
+                        storedEnergy_[siteI],
+                        targetLatentEnergy_[siteI]
+                    );
+
+                    if
+                    (
+                        handoffVaporFraction
+                      <= maxPreexistingHandoffVaporFraction_ + SMALL
+                    )
+                    {
+                        siteState_[siteI] = CREATING_DETACHED_BUBBLE;
+                        creationStep_[siteI] = 0;
+                    }
+                    else if
+                    (
+                        writeDiagnostics_
+                     && Pstream::master()
+                     &&
+                        (
+                            timeIndex % diagnosticsInterval_ == 0
+                         || mesh.time().writeTime()
+                        )
+                    )
+                    {
+                        Info<< "POPULATION_HANDOFF_BLOCKED"
+                            << " site=" << siteI
+                            << " cycle=" << cycleId_[siteI]
+                            << " time=" << timeValue
+                            << " handoffVaporFraction="
+                            << handoffVaporFraction
+                            << " maximum="
+                            << maxPreexistingHandoffVaporFraction_
+                            << " storedEnergy=" << storedEnergy_[siteI]
+                            << " targetEnergy="
+                            << targetLatentEnergy_[siteI]
+                            << endl;
+                    }
                 }
             }
         }
@@ -1056,6 +1130,7 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 << " activationSuperheat="
                 << siteActivationSuperheat_[siteI]
                 << " shieldVapor=" << localShieldVapor
+                << " handoffVaporFraction=" << handoffVaporFraction
                 << " captureArea=" << captureArea_[siteI]
                 << " storedEnergy=" << storedEnergy_[siteI]
                 << " targetEnergy=" << targetLatentEnergy_[siteI]
