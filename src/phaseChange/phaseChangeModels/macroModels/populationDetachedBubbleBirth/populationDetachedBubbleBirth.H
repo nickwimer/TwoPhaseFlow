@@ -40,6 +40,7 @@ private:
     scalar interfaceWidthCells_;
     scalar targetVaporFraction_;
     scalar maxAlphaVaporPerStep_;
+    scalar maxPreexistingHandoffVaporFraction_;
     label creationSteps_;
     label maximumCreationSteps_;
 
