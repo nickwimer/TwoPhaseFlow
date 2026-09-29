@@ -809,6 +809,21 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 scalar(1)
             )
           : scalar(0);
+        const scalar macroCreatedVaporFraction =
+            targetVaporVolume_[siteI] > SMALL
+          ? min
+            (
+                createdVaporVolume_[siteI]/targetVaporVolume_[siteI],
+                scalar(1)
+            )
+          : scalar(0);
+        const scalar unfundedHandoffVaporFraction = max
+        (
+            handoffVaporFraction - macroCreatedVaporFraction,
+            scalar(0)
+        );
+        const bool strictHandoffAccounting =
+            maxPreexistingHandoffVaporFraction_ < scalar(1) - SMALL;
 
         const label oldState = siteState_[siteI];
 
@@ -863,7 +878,7 @@ void Foam::populationDetachedBubbleBirth::updateSources()
 
                     if
                     (
-                        handoffVaporFraction
+                        unfundedHandoffVaporFraction
                       <= maxPreexistingHandoffVaporFraction_ + SMALL
                     )
                     {
@@ -887,6 +902,8 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                             << " time=" << timeValue
                             << " handoffVaporFraction="
                             << handoffVaporFraction
+                            << " unfundedHandoffVaporFraction="
+                            << unfundedHandoffVaporFraction
                             << " maximum="
                             << maxPreexistingHandoffVaporFraction_
                             << " storedEnergy=" << storedEnergy_[siteI]
@@ -900,6 +917,14 @@ void Foam::populationDetachedBubbleBirth::updateSources()
         else if (siteState_[siteI] == CREATING_DETACHED_BUBBLE)
         {
             storedEnergy_[siteI] += localWallEnergy;
+            if (strictHandoffAccounting)
+            {
+                storedEnergy_[siteI] = min
+                (
+                    storedEnergy_[siteI],
+                    targetLatentEnergy_[siteI]
+                );
+            }
             creationStep_[siteI]++;
 
             scalar localRemainingVolume = 0;
@@ -960,8 +985,59 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 localRemainingVolume <= volumeTolerance;
             const bool latentBudgetComplete =
                 remainingLatentBudget <= energyTolerance;
+            const bool unfundedVaporBlocked =
+                strictHandoffAccounting
+             && unfundedHandoffVaporFraction
+                > maxPreexistingHandoffVaporFraction_ + SMALL;
+            const bool fullStencilBeforeBudget =
+                strictHandoffAccounting
+             && stencilComplete
+             && !latentBudgetComplete;
 
-            if (stencilComplete || latentBudgetComplete)
+            if (unfundedVaporBlocked || fullStencilBeforeBudget)
+            {
+                creationStep_[siteI] = max
+                (
+                    creationStep_[siteI] - 1,
+                    label(0)
+                );
+
+                if
+                (
+                    writeDiagnostics_
+                 && Pstream::master()
+                 &&
+                    (
+                        timeIndex % diagnosticsInterval_ == 0
+                     || mesh.time().writeTime()
+                     || fullStencilBeforeBudget
+                    )
+                )
+                {
+                    Info<< "POPULATION_HANDOFF_BLOCKED"
+                        << " site=" << siteI
+                        << " cycle=" << cycleId_[siteI]
+                        << " time=" << timeValue
+                        << " stage=creating"
+                        << " handoffVaporFraction="
+                        << handoffVaporFraction
+                        << " macroCreatedVaporFraction="
+                        << macroCreatedVaporFraction
+                        << " unfundedHandoffVaporFraction="
+                        << unfundedHandoffVaporFraction
+                        << " maximum="
+                        << maxPreexistingHandoffVaporFraction_
+                        << " stencilComplete=" << stencilComplete
+                        << " remainingLatentBudget="
+                        << remainingLatentBudget
+                        << endl;
+                }
+            }
+            else if
+            (
+                latentBudgetComplete
+             || (!strictHandoffAccounting && stencilComplete)
+            )
             {
                 siteState_[siteI] = WAITING_FOR_CLEARANCE;
                 releaseTime_[siteI] = timeValue;
@@ -1131,6 +1207,8 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 << siteActivationSuperheat_[siteI]
                 << " shieldVapor=" << localShieldVapor
                 << " handoffVaporFraction=" << handoffVaporFraction
+                << " unfundedHandoffVaporFraction="
+                << unfundedHandoffVaporFraction
                 << " captureArea=" << captureArea_[siteI]
                 << " storedEnergy=" << storedEnergy_[siteI]
                 << " targetEnergy=" << targetLatentEnergy_[siteI]
