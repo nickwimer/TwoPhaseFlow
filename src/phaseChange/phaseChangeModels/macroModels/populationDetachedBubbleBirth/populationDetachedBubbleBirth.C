@@ -97,6 +97,10 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
             1.0
         )
     ),
+    maximumHandoffDuration_
+    (
+        modelDict().lookupOrDefault<scalar>("maximumHandoffDuration", -1.0)
+    ),
     creationSteps_(modelDict().lookupOrDefault<label>("creationSteps", 30)),
     maximumCreationSteps_
     (
@@ -138,6 +142,10 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     (
         modelDict().lookupOrDefault<Switch>("writeDiagnostics", true)
     ),
+    writeHandoffAudit_
+    (
+        modelDict().lookupOrDefault<Switch>("writeHandoffAudit", false)
+    ),
     diagnosticPrefix_
     (
         modelDict().lookupOrDefault<word>
@@ -164,6 +172,9 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     activationDuration_(),
     storedEnergy_(),
     releaseTime_(),
+    creationStartTime_(),
+    initialSensibleCredit_(),
+    chargedWallEnergy_(),
     nextActivationTime_(),
     creationStep_(),
     cycleId_(),
@@ -257,6 +268,9 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     activationDuration_.setSize(nSites, 0.0);
     storedEnergy_.setSize(nSites, 0.0);
     releaseTime_.setSize(nSites, -GREAT);
+    creationStartTime_.setSize(nSites, -GREAT);
+    initialSensibleCredit_.setSize(nSites, 0.0);
+    chargedWallEnergy_.setSize(nSites, 0.0);
     nextActivationTime_.setSize(nSites, 0.0);
     creationStep_.setSize(nSites, 0);
     cycleId_.setSize(nSites, 0);
@@ -282,6 +296,8 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
             << ", targetVaporFraction=" << targetVaporFraction_
             << ", maxPreexistingHandoffVaporFraction="
             << maxPreexistingHandoffVaporFraction_
+            << ", maximumHandoffDuration=" << maximumHandoffDuration_
+            << ", writeHandoffAudit=" << writeHandoffAudit_
             << ", continuitySourceMode=" << continuitySourceMode_
             << ", parallel=" << Pstream::parRun()
             << endl;
@@ -461,6 +477,12 @@ void Foam::populationDetachedBubbleBirth::validateControls() const
     {
         FatalErrorInFunction
             << "continuitySourceMode must be vaporMass or none"
+            << exit(FatalError);
+    }
+    if (maximumHandoffDuration_ != -1.0 && maximumHandoffDuration_ <= 0)
+    {
+        FatalErrorInFunction
+            << "maximumHandoffDuration must be positive or -1 (disabled)"
             << exit(FatalError);
     }
     if (diagnosticsInterval_ < 1)
@@ -694,6 +716,9 @@ void Foam::populationDetachedBubbleBirth::resetSite
     createdVaporMass_[siteI] = 0;
     consumedLatentEnergy_[siteI] = 0;
     releaseTime_[siteI] = -GREAT;
+    creationStartTime_[siteI] = -GREAT;
+    initialSensibleCredit_[siteI] = 0.0;
+    chargedWallEnergy_[siteI] = 0.0;
     nextActivationTime_[siteI] = timeValue + minimumRearmDelay_;
 }
 
@@ -851,6 +876,8 @@ void Foam::populationDetachedBubbleBirth::updateSources()
             {
                 siteState_[siteI] = CHARGING_DEPARTURE_BUBBLE;
                 storedEnergy_[siteI] = localSensibleEnergy;
+                initialSensibleCredit_[siteI] = localSensibleEnergy;
+                chargedWallEnergy_[siteI] = 0.0;
                 activationDuration_[siteI] = 0;
                 cycleId_[siteI]++;
             }
@@ -864,6 +891,7 @@ void Foam::populationDetachedBubbleBirth::updateSources()
             else
             {
                 storedEnergy_[siteI] += localWallEnergy;
+                chargedWallEnergy_[siteI] += localWallEnergy;
                 if
                 (
                     storedEnergy_[siteI] + VSMALL
@@ -884,6 +912,24 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                     {
                         siteState_[siteI] = CREATING_DETACHED_BUBBLE;
                         creationStep_[siteI] = 0;
+                        creationStartTime_[siteI] = timeValue;
+                        if (writeHandoffAudit_ && Pstream::master())
+                        {
+                            Info<< "POPULATION_HANDOFF_FUNDED"
+                                << " site=" << siteI
+                                << " cycle=" << cycleId_[siteI]
+                                << " time=" << timeValue
+                                << " initialSensibleCredit="
+                                << initialSensibleCredit_[siteI]
+                                << " cumulativeWallEnergy="
+                                << chargedWallEnergy_[siteI]
+                                << " storedEnergy=" << storedEnergy_[siteI]
+                                << " targetLatentEnergy="
+                                << targetLatentEnergy_[siteI]
+                                << " handoffVaporFraction="
+                                << handoffVaporFraction
+                                << endl;
+                        }
                     }
                     else if
                     (
@@ -916,6 +962,43 @@ void Foam::populationDetachedBubbleBirth::updateSources()
         }
         else if (siteState_[siteI] == CREATING_DETACHED_BUBBLE)
         {
+            const scalar handoffAge = timeValue - creationStartTime_[siteI];
+            if
+            (
+                maximumHandoffDuration_ > 0
+             && handoffAge > maximumHandoffDuration_ + SMALL
+            )
+            {
+                FatalErrorInFunction
+                    << "POPULATION_HANDOFF_TIMEOUT site=" << siteI
+                    << " cycle=" << cycleId_[siteI]
+                    << " time=" << timeValue
+                    << " age=" << handoffAge
+                    << " maximum=" << maximumHandoffDuration_
+                    << " consumedLatentEnergy=" << consumedLatentEnergy_[siteI]
+                    << " targetLatentEnergy=" << targetLatentEnergy_[siteI]
+                    << " createdVaporVolume=" << createdVaporVolume_[siteI]
+                    << " handoffVaporFraction=" << handoffVaporFraction
+                    << " unfundedHandoffVaporFraction="
+                    << unfundedHandoffVaporFraction
+                    << exit(FatalError);
+            }
+            if (writeHandoffAudit_ && Pstream::master())
+            {
+                Info<< "POPULATION_HANDOFF_STATE"
+                    << " site=" << siteI
+                    << " cycle=" << cycleId_[siteI]
+                    << " time=" << timeValue
+                    << " age=" << handoffAge
+                    << " handoffVaporFraction=" << handoffVaporFraction
+                    << " macroCreatedVaporFraction=" << macroCreatedVaporFraction
+                    << " unfundedHandoffVaporFraction="
+                    << unfundedHandoffVaporFraction
+                    << " storedEnergy=" << storedEnergy_[siteI]
+                    << " consumedLatentEnergy=" << consumedLatentEnergy_[siteI]
+                    << " targetLatentEnergy=" << targetLatentEnergy_[siteI]
+                    << endl;
+            }
             storedEnergy_[siteI] += localWallEnergy;
             if (strictHandoffAccounting)
             {
@@ -1132,6 +1215,24 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                     storedEnergy_[siteI] - localConsumedEnergy,
                     scalar(0)
                 );
+
+                if (writeHandoffAudit_ && Pstream::master())
+                {
+                    Info<< "POPULATION_HANDOFF_SOURCE"
+                        << " site=" << siteI
+                        << " cycle=" << cycleId_[siteI]
+                        << " time=" << timeValue
+                        << " age=" << handoffAge
+                        << " deltaVaporVolume=" << localCreatedVolume
+                        << " deltaVaporMass=" << localCreatedMass
+                        << " deltaLatentEnergy=" << localConsumedEnergy
+                        << " createdVaporVolume=" << createdVaporVolume_[siteI]
+                        << " createdVaporMass=" << createdVaporMass_[siteI]
+                        << " consumedLatentEnergy=" << consumedLatentEnergy_[siteI]
+                        << " targetLatentEnergy=" << targetLatentEnergy_[siteI]
+                        << " remainingStencilVolume=" << localRemainingVolume
+                        << endl;
+                }
 
                 const scalar postSourceRemainingLatentBudget = max
                 (

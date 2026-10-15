@@ -41,6 +41,7 @@ private:
     scalar targetVaporFraction_;
     scalar maxAlphaVaporPerStep_;
     scalar maxPreexistingHandoffVaporFraction_;
+    scalar maximumHandoffDuration_;
     label creationSteps_;
     label maximumCreationSteps_;
 
@@ -54,6 +55,7 @@ private:
 
     word continuitySourceMode_;
     Switch writeDiagnostics_;
+    Switch writeHandoffAudit_;
     word diagnosticPrefix_;
     label diagnosticsInterval_;
 
@@ -74,6 +76,9 @@ private:
     scalarField activationDuration_;
     scalarField storedEnergy_;
     scalarField releaseTime_;
+    scalarField creationStartTime_;
+    scalarField initialSensibleCredit_;
+    scalarField chargedWallEnergy_;
     scalarField nextActivationTime_;
     labelList creationStep_;
     labelList cycleId_;
