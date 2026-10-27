@@ -62,6 +62,7 @@ Description
 #include "singleComponentPhaseChange.H"
 
 #include "UPstream.H"
+#include "PstreamReduceOps.H"
 
 #include <cstdlib>
 
@@ -99,6 +100,9 @@ int main(int argc, char *argv[])
     #include "solidRegionDiffusionNo.H"
 
     const bool overwrite = args.found("overwrite");
+
+    // Case224: optional diagnostics only. No changes to VOF/CHT equations.
+    #include "massBalanceInitialize.H"
 
     while (runTime.run())
     {
@@ -139,6 +143,11 @@ int main(int argc, char *argv[])
             }
 
 
+        }
+
+        if (massBalanceDiagnostics)
+        {
+            #include "massBalanceAfterStep.H"
         }
 
         runTime.write();
