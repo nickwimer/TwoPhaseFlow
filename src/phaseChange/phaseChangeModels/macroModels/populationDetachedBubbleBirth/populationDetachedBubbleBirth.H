@@ -45,6 +45,12 @@ private:
     label creationSteps_;
     label maximumCreationSteps_;
 
+    // Time over which a funded bubble is created, in seconds. When positive
+    // it replaces the step counts above, so the rate at which vapor is
+    // created, and with displacedLiquid the speed of the liquid it pushes
+    // aside, does not depend on the time step.
+    scalar creationDuration_;
+
     scalar wallFluxUseFraction_;
     scalar sensibleReserveFraction_;
 

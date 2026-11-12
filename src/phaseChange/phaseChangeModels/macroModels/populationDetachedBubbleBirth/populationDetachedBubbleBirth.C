@@ -106,6 +106,10 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     (
         modelDict().lookupOrDefault<label>("maximumCreationSteps", 300)
     ),
+    creationDuration_
+    (
+        modelDict().lookupOrDefault<scalar>("creationDuration", -1.0)
+    ),
     wallFluxUseFraction_
     (
         modelDict().lookupOrDefault<scalar>("wallFluxUseFraction", 1.0)
@@ -364,6 +368,7 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
             << ", fluxMode=" << wallBoilingFluxMode_
             << ", fluxField=" << wallBoilingFluxFieldName_
             << ", displacementShellCells=" << displacementShellCells_
+            << ", creationDuration=" << creationDuration_
             << endl;
     }
 }
@@ -542,6 +547,12 @@ void Foam::populationDetachedBubbleBirth::validateControls() const
     {
         FatalErrorInFunction
             << "continuitySourceMode must be vaporMass, displacedLiquid or none"
+            << exit(FatalError);
+    }
+    if (creationDuration_ != -1.0 && creationDuration_ <= 0)
+    {
+        FatalErrorInFunction
+            << "creationDuration must be positive or -1 (use creationSteps)"
             << exit(FatalError);
     }
     if (displacementShellCells_ <= 0)
@@ -1212,6 +1223,14 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 creationSteps_ - creationStep_[siteI] + 1,
                 label(1)
             );
+            // Share of the still-missing vapor to request in this step.
+            scalar stepFraction = scalar(1)/scalar(remainingSteps);
+            if (creationDuration_ > 0)
+            {
+                const scalar remainingTime = creationDuration_ - handoffAge;
+                stepFraction =
+                    remainingTime > deltaT ? deltaT/remainingTime : scalar(1);
+            }
 
             forAll(releaseCells, releaseI)
             {
@@ -1228,7 +1247,7 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 }
                 const scalar alphaStep = min
                 (
-                    remaining/scalar(remainingSteps),
+                    remaining*stepFraction,
                     min(maxAlphaVaporPerStep_, alphaLiquid)
                 );
                 requestedAlpha[releaseI] = alphaStep;
@@ -1525,9 +1544,13 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                   - consumedLatentEnergy_[siteI],
                     scalar(0)
                 );
+                const bool creationOverdue =
+                    creationDuration_ > 0
+                  ? handoffAge > scalar(10)*creationDuration_
+                  : creationStep_[siteI] >= maximumCreationSteps_;
                 if
                 (
-                    creationStep_[siteI] >= maximumCreationSteps_
+                    creationOverdue
                  && postSourceRemainingLatentBudget > energyTolerance
                 )
                 {
