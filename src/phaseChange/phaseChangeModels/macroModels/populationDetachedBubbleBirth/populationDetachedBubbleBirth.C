@@ -138,6 +138,38 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     (
         modelDict().lookupOrDefault<word>("continuitySourceMode", "vaporMass")
     ),
+    wallBoilingClosure_
+    (
+        modelDict().lookupOrDefault<word>("wallBoilingClosure", "none")
+    ),
+    wallBoilingCoefficient_
+    (
+        modelDict().lookupOrDefault<scalar>("wallBoilingCoefficient", 0.0)
+    ),
+    wallBoilingExponent_
+    (
+        modelDict().lookupOrDefault<scalar>("wallBoilingExponent", 3.0)
+    ),
+    wallBoilingMaxFlux_
+    (
+        modelDict().lookupOrDefault<scalar>("wallBoilingMaxFlux", -1.0)
+    ),
+    wallBoilingFluxMode_
+    (
+        modelDict().lookupOrDefault<word>("wallBoilingFluxMode", "total")
+    ),
+    wallBoilingFluxFieldName_
+    (
+        modelDict().lookupOrDefault<word>
+        (
+            "wallBoilingFluxField",
+            "qWallBoiling"
+        )
+    ),
+    displacementShellCells_
+    (
+        modelDict().lookupOrDefault<scalar>("displacementShellCells", 4.0)
+    ),
     writeDiagnostics_
     (
         modelDict().lookupOrDefault<Switch>("writeDiagnostics", true)
@@ -164,6 +196,7 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     sphereCells_(),
     sphereTargetVapor_(),
     shieldingCells_(),
+    displacementCells_(),
     captureArea_(),
     targetVaporVolume_(),
     targetVaporMass_(),
@@ -181,6 +214,11 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     createdVaporVolume_(),
     createdVaporMass_(),
     consumedLatentEnergy_(),
+    boilingEnergy_(),
+    cumulativeBoilingEnergy_(),
+    cumulativeBoilingBubbleEnergy_(),
+    cumulativeDisplacedLiquidVolume_(0.0),
+    cumulativeBirthVaporVolume_(0.0),
     activeReleaseMask_
     (
         IOobject
@@ -250,6 +288,20 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
         phase1.mesh(),
         dimensionedScalar("zero", dimPower/dimVol, 0.0),
         "zeroGradient"
+    ),
+    wallBoilingFlux_
+    (
+        IOobject
+        (
+            wallBoilingFluxFieldName_,
+            phase1.mesh().time().timeName(),
+            phase1.mesh(),
+            IOobject::NO_READ,
+            writeDiagnostics_ ? IOobject::AUTO_WRITE : IOobject::NO_WRITE
+        ),
+        phase1.mesh(),
+        dimensionedScalar("zero", dimPower/dimArea, 0.0),
+        "calculated"
     )
 {
     if (energyOwnershipMode_ == "persistentVoronoi")
@@ -277,6 +329,9 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     createdVaporVolume_.setSize(nSites, 0.0);
     createdVaporMass_.setSize(nSites, 0.0);
     consumedLatentEnergy_.setSize(nSites, 0.0);
+    boilingEnergy_.setSize(nSites, 0.0);
+    cumulativeBoilingEnergy_.setSize(nSites, 0.0);
+    cumulativeBoilingBubbleEnergy_.setSize(nSites, 0.0);
 
     forAll(nextActivationTime_, siteI)
     {
@@ -300,6 +355,15 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
             << ", writeHandoffAudit=" << writeHandoffAudit_
             << ", continuitySourceMode=" << continuitySourceMode_
             << ", parallel=" << Pstream::parRun()
+            << endl;
+        Info<< "populationDetachedBubbleBirth wall boiling closure: "
+            << wallBoilingClosure_
+            << ", coefficient=" << wallBoilingCoefficient_
+            << ", exponent=" << wallBoilingExponent_
+            << ", maxFlux=" << wallBoilingMaxFlux_
+            << ", fluxMode=" << wallBoilingFluxMode_
+            << ", fluxField=" << wallBoilingFluxFieldName_
+            << ", displacementShellCells=" << displacementShellCells_
             << endl;
     }
 }
@@ -472,11 +536,51 @@ void Foam::populationDetachedBubbleBirth::validateControls() const
     if
     (
         continuitySourceMode_ != "vaporMass"
+     && continuitySourceMode_ != "displacedLiquid"
      && continuitySourceMode_ != "none"
     )
     {
         FatalErrorInFunction
-            << "continuitySourceMode must be vaporMass or none"
+            << "continuitySourceMode must be vaporMass, displacedLiquid or none"
+            << exit(FatalError);
+    }
+    if (displacementShellCells_ <= 0)
+    {
+        FatalErrorInFunction
+            << "displacementShellCells must be positive"
+            << exit(FatalError);
+    }
+    if
+    (
+        wallBoilingClosure_ != "none"
+     && wallBoilingClosure_ != "powerLaw"
+    )
+    {
+        FatalErrorInFunction
+            << "wallBoilingClosure must be none or powerLaw; found "
+            << wallBoilingClosure_
+            << exit(FatalError);
+    }
+    if
+    (
+        wallBoilingClosure_ == "powerLaw"
+     && (wallBoilingCoefficient_ <= 0 || wallBoilingExponent_ < 1)
+    )
+    {
+        FatalErrorInFunction
+            << "wallBoilingClosure powerLaw requires "
+            << "wallBoilingCoefficient > 0 and wallBoilingExponent >= 1"
+            << exit(FatalError);
+    }
+    if
+    (
+        wallBoilingFluxMode_ != "total"
+     && wallBoilingFluxMode_ != "additional"
+    )
+    {
+        FatalErrorInFunction
+            << "wallBoilingFluxMode must be total or additional; found "
+            << wallBoilingFluxMode_
             << exit(FatalError);
     }
     if (maximumHandoffDuration_ != -1.0 && maximumHandoffDuration_ <= 0)
@@ -556,6 +660,7 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
     sphereCells_.setSize(nSites);
     sphereTargetVapor_.setSize(nSites);
     shieldingCells_.setSize(nSites);
+    displacementCells_.setSize(nSites);
     captureArea_.setSize(nSites, 0.0);
     targetVaporVolume_.setSize(nSites, 0.0);
     targetVaporMass_.setSize(nSites, 0.0);
@@ -609,6 +714,7 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
         const vector bubbleCentre =
             site + vector(0, 0, departureRadius_ + detachmentGap_);
         DynamicList<label> localSphereCells;
+        DynamicList<label> localDisplacementCells;
         DynamicList<scalar> localTargets;
         scalar localVolume = 0;
         scalar localMass = 0;
@@ -643,8 +749,20 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
                 localLatent += vaporMass*satModel_.L()[celli];
                 localCoreCells += target > 0.95;
             }
+            else if
+            (
+                continuitySourceMode_ == "displacedLiquid"
+             && mag(mesh.C()[celli] - bubbleCentre)
+             <= departureRadius_ + displacementShellCells_*cellSize
+            )
+            {
+                // Liquid just outside the new bubble. It receives the
+                // volume of liquid the bubble pushes aside.
+                localDisplacementCells.append(celli);
+            }
         }
         sphereCells_[siteI].transfer(localSphereCells);
+        displacementCells_[siteI].transfer(localDisplacementCells);
         sphereTargetVapor_[siteI].setSize(localTargets.size());
         forAll(sphereTargetVapor_[siteI], targetI)
         {
@@ -682,6 +800,21 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
         reduce(globalFaceCount, sumOp<label>());
         reduce(globalSphereCount, sumOp<label>());
         reduce(globalShieldCount, sumOp<label>());
+
+        label globalDisplacementCount = displacementCells_[siteI].size();
+        reduce(globalDisplacementCount, sumOp<label>());
+        if
+        (
+            continuitySourceMode_ == "displacedLiquid"
+         && globalDisplacementCount == 0
+        )
+        {
+            FatalErrorInFunction
+                << "Site " << siteI << " at " << site
+                << " has no cells around its bubble to receive displaced "
+                << "liquid"
+                << exit(FatalError);
+        }
 
         if
         (
@@ -762,6 +895,15 @@ void Foam::populationDetachedBubbleBirth::updateSources()
         liquidTemperature.boundaryField()[patchID_].snGrad();
     const scalarField& snGrad = tSnGrad();
 
+    const bool boilingClosure = wallBoilingClosure_ != "none";
+    fvPatchScalarField& boilingFluxPatch =
+        wallBoilingFlux_.boundaryFieldRef()[patchID_];
+    boilingFluxPatch = scalar(0);
+    scalar totalBoilingPower = 0;
+    scalar totalConductionPower = 0;
+    const bool diagnosticsStep =
+        timeIndex % diagnosticsInterval_ == 0 || mesh.time().writeTime();
+
     forAll(siteCentres_, siteI)
     {
         scalar localSuperheatArea = 0;
@@ -787,6 +929,58 @@ void Foam::populationDetachedBubbleBirth::updateSources()
         reduce(localWallEnergy, sumOp<scalar>());
         const scalar meanWallSuperheat =
             localArea > SMALL ? localSuperheatArea/localArea : scalar(0);
+
+        // Wall boiling closure. The flux leaves the solid through the
+        // coupled boundary (qr/qrNbr read wallBoilingFlux_) and is credited
+        // to this site in every lifecycle state, so the heater energy
+        // balance does not depend on when the next bubble may form.
+        scalar localBoilingPower = 0;
+        scalar localConductionPower = 0;
+        if
+        (
+            boilingClosure
+         && meanWallSuperheat + SMALL >= siteActivationSuperheat_[siteI]
+        )
+        {
+            forAll(faces, faceListI)
+            {
+                const label faceI = faces[faceListI];
+                const label celli = faceCells[faceI];
+                const scalar area = mag(faceAreaVectors[faceI]);
+                const scalar superheat =
+                    max(wallTemperature[faceI] - TSat(celli), scalar(0));
+                const scalar conductionFlux =
+                    max(kappaPatch[faceI]*snGrad[faceI], scalar(0));
+                scalar lawFlux =
+                    wallBoilingCoefficient_
+                   *Foam::pow(superheat, wallBoilingExponent_);
+                if (wallBoilingMaxFlux_ > 0)
+                {
+                    lawFlux = min(lawFlux, wallBoilingMaxFlux_);
+                }
+                // "total": the law is the whole wall heat flux, so only
+                // the part the mesh does not already conduct is added.
+                scalar boilingFlux =
+                    wallBoilingFluxMode_ == "total"
+                  ? max(lawFlux - conductionFlux, scalar(0))
+                  : lawFlux;
+                // No nucleate boiling where the wall cell is dry.
+                boilingFlux *=
+                    max(min(phase1_[celli], scalar(1)), scalar(0));
+
+                boilingFluxPatch[faceI] = -boilingFlux;
+                localBoilingPower += boilingFlux*area;
+                localConductionPower += conductionFlux*area;
+            }
+            reduce(localBoilingPower, sumOp<scalar>());
+            reduce(localConductionPower, sumOp<scalar>());
+
+            const scalar boilingEnergyStep = localBoilingPower*deltaT;
+            boilingEnergy_[siteI] += boilingEnergyStep;
+            cumulativeBoilingEnergy_[siteI] += boilingEnergyStep;
+            totalBoilingPower += localBoilingPower;
+            totalConductionPower += localConductionPower;
+        }
 
         scalar localShieldVapor = 0;
         const labelList& shieldCells = shieldingCells_[siteI];
@@ -894,7 +1088,7 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 chargedWallEnergy_[siteI] += localWallEnergy;
                 if
                 (
-                    storedEnergy_[siteI] + VSMALL
+                    storedEnergy_[siteI] + boilingEnergy_[siteI] + VSMALL
                  >= targetLatentEnergy_[siteI]
                 )
                 {
@@ -1151,7 +1345,8 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                   ? min
                     (
                         scalar(1),
-                        storedEnergy_[siteI]/localRequestedEnergy
+                        (storedEnergy_[siteI] + boilingEnergy_[siteI])
+                       /localRequestedEnergy
                     )
                   : scalar(0);
                 const scalar budgetEnergyScale =
@@ -1168,9 +1363,22 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                     budgetEnergyScale
                 );
 
+                // Energy taken from the heater by the wall boiling closure
+                // is spent first. That part of the bubble has already been
+                // paid for by the solid, so it must not also be removed
+                // from the fluid as a latent sink.
+                const scalar requestedEnergy =
+                    energyScale*localRequestedEnergy;
+                const scalar boilingShare =
+                    requestedEnergy > SMALL
+                  ? min(boilingEnergy_[siteI], requestedEnergy)
+                   /requestedEnergy
+                  : scalar(0);
+
                 scalar localCreatedVolume = 0;
                 scalar localCreatedMass = 0;
                 scalar localConsumedEnergy = 0;
+                scalar localDisplacedVolumeRate = 0;
                 forAll(releaseCells, releaseI)
                 {
                     const scalar alphaStep =
@@ -1190,8 +1398,16 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                     {
                         massBirthSource_[celli] += vaporMassRate;
                     }
-                    latentSink_[celli] += latentRate;
+                    latentSink_[celli] +=
+                        (scalar(1) - boilingShare)*latentRate;
                     activeReleaseMask_[celli] = scalar(1);
+                    // Liquid in these cells is converted in place. Only
+                    // rhoV/rhoL of it really evaporates; the rest has to
+                    // be pushed aside, not deleted.
+                    localDisplacedVolumeRate +=
+                        alphaRate
+                       *mesh.V()[celli]
+                       *max(scalar(1) - rhoV[celli]/rhoL[celli], scalar(0));
 
                     const scalar createdVolume =
                         alphaStep*mesh.V()[celli];
@@ -1210,11 +1426,80 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 createdVaporVolume_[siteI] += localCreatedVolume;
                 createdVaporMass_[siteI] += localCreatedMass;
                 consumedLatentEnergy_[siteI] += localConsumedEnergy;
-                storedEnergy_[siteI] = max
+                const scalar boilingConsumed =
+                    boilingShare*localConsumedEnergy;
+                boilingEnergy_[siteI] = max
                 (
-                    storedEnergy_[siteI] - localConsumedEnergy,
+                    boilingEnergy_[siteI] - boilingConsumed,
                     scalar(0)
                 );
+                cumulativeBoilingBubbleEnergy_[siteI] += boilingConsumed;
+                storedEnergy_[siteI] = max
+                (
+                    storedEnergy_[siteI]
+                  - (localConsumedEnergy - boilingConsumed),
+                    scalar(0)
+                );
+                cumulativeBirthVaporVolume_ += localCreatedVolume;
+
+                if (continuitySourceMode_ == "displacedLiquid")
+                {
+                    // Return the displaced liquid as a volume source in
+                    // the pure-liquid cells around the bubble. The solver
+                    // divides the mass source by the mixture density, and
+                    // its alpha equation keeps a full liquid cell full, so
+                    // this adds exactly that volume of liquid.
+                    reduce(localDisplacedVolumeRate, sumOp<scalar>());
+                    const labelList& shellCells = displacementCells_[siteI];
+                    const scalar liquidShellThreshold = 0.999;
+                    scalar localShellVolume = 0;
+                    forAll(shellCells, shellI)
+                    {
+                        const label celli = shellCells[shellI];
+                        if (phase1_[celli] > liquidShellThreshold)
+                        {
+                            localShellVolume += mesh.V()[celli];
+                        }
+                    }
+                    reduce(localShellVolume, sumOp<scalar>());
+
+                    if (localShellVolume > SMALL)
+                    {
+                        const scalar volumeSource =
+                            localDisplacedVolumeRate/localShellVolume;
+                        forAll(shellCells, shellI)
+                        {
+                            const label celli = shellCells[shellI];
+                            const scalar alphaLiquid = phase1_[celli];
+                            if (alphaLiquid > liquidShellThreshold)
+                            {
+                                massBirthSource_[celli] +=
+                                    volumeSource
+                                   *(
+                                        alphaLiquid*rhoL[celli]
+                                      + (scalar(1) - alphaLiquid)*rhoV[celli]
+                                    );
+                            }
+                        }
+                        cumulativeDisplacedLiquidVolume_ +=
+                            localDisplacedVolumeRate*deltaT;
+                    }
+                    else if
+                    (
+                        localDisplacedVolumeRate > SMALL
+                     && Pstream::master()
+                    )
+                    {
+                        Info<< "POPULATION_DISPLACEMENT_SKIPPED"
+                            << " site=" << siteI
+                            << " cycle=" << cycleId_[siteI]
+                            << " time=" << timeValue
+                            << " displacedVolumeRate="
+                            << localDisplacedVolumeRate
+                            << " reason=noLiquidShell"
+                            << endl;
+                    }
+                }
 
                 if (writeHandoffAudit_ && Pstream::master())
                 {
@@ -1315,6 +1600,47 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 << " targetEnergy=" << targetLatentEnergy_[siteI]
                 << " createdVolume=" << createdVaporVolume_[siteI]
                 << " targetVolume=" << targetVaporVolume_[siteI]
+                << endl;
+
+            if (boilingClosure)
+            {
+                Info<< "POPULATION_SITE_BOILING"
+                    << " site=" << siteI
+                    << " time=" << timeValue
+                    << " meanWallSuperheat=" << meanWallSuperheat
+                    << " boilingPower=" << localBoilingPower
+                    << " conductionPower=" << localConductionPower
+                    << " boilingEnergy=" << boilingEnergy_[siteI]
+                    << " cumulativeBoilingEnergy="
+                    << cumulativeBoilingEnergy_[siteI]
+                    << " cumulativeBubbleEnergy="
+                    << cumulativeBoilingBubbleEnergy_[siteI]
+                    << endl;
+            }
+        }
+    }
+
+    if (writeDiagnostics_ && diagnosticsStep && Pstream::master())
+    {
+        if (boilingClosure)
+        {
+            Info<< "POPULATION_BOILING_BALANCE"
+                << " time=" << timeValue
+                << " boilingPower=" << totalBoilingPower
+                << " conductionPower=" << totalConductionPower
+                << " cumulativeBoilingEnergy=" << sum(cumulativeBoilingEnergy_)
+                << " cumulativeBubbleEnergy="
+                << sum(cumulativeBoilingBubbleEnergy_)
+                << " storedBoilingEnergy=" << sum(boilingEnergy_)
+                << endl;
+        }
+        if (continuitySourceMode_ == "displacedLiquid")
+        {
+            Info<< "POPULATION_DISPLACEMENT_BALANCE"
+                << " time=" << timeValue
+                << " birthVaporVolume=" << cumulativeBirthVaporVolume_
+                << " displacedLiquidVolume="
+                << cumulativeDisplacedLiquidVolume_
                 << endl;
         }
     }

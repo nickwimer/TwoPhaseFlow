@@ -54,6 +54,28 @@ private:
     scalar shieldingAlphaVaporThreshold_;
 
     word continuitySourceMode_;
+
+    // Wall boiling closure. The resolved conduction flux into the first
+    // liquid cell is limited by the wall-normal mesh spacing and is far below
+    // a nucleate-boiling heat flux. With the closure enabled, each heater
+    // face owned by an active site also passes the boiling heat flux
+    //     qLaw = wallBoilingCoefficient*superheat^wallBoilingExponent
+    // out of the solid. That flux is published as a boundary field which the
+    // coupled temperature boundary conditions read through their qr/qrNbr
+    // entries, and the same energy is credited to the owning site, where it
+    // funds detached bubbles. Bubble formation itself is unchanged.
+    word wallBoilingClosure_;
+    scalar wallBoilingCoefficient_;
+    scalar wallBoilingExponent_;
+    scalar wallBoilingMaxFlux_;
+    word wallBoilingFluxMode_;
+    word wallBoilingFluxFieldName_;
+
+    // Width, in local cell sizes, of the liquid shell around a new bubble
+    // that receives the displaced liquid (continuitySourceMode
+    // displacedLiquid).
+    scalar displacementShellCells_;
+
     Switch writeDiagnostics_;
     Switch writeHandoffAudit_;
     word diagnosticPrefix_;
@@ -66,6 +88,7 @@ private:
     List<labelList> sphereCells_;
     List<scalarField> sphereTargetVapor_;
     List<labelList> shieldingCells_;
+    List<labelList> displacementCells_;
 
     scalarField captureArea_;
     scalarField targetVaporVolume_;
@@ -87,11 +110,24 @@ private:
     scalarField createdVaporMass_;
     scalarField consumedLatentEnergy_;
 
+    // Energy removed from the solid by the wall boiling closure and not yet
+    // turned into vapor. It is never reset: every joule taken from the
+    // heater must reappear as latent heat of a bubble.
+    scalarField boilingEnergy_;
+    scalarField cumulativeBoilingEnergy_;
+    scalarField cumulativeBoilingBubbleEnergy_;
+    scalar cumulativeDisplacedLiquidVolume_;
+    scalar cumulativeBirthVaporVolume_;
+
     volScalarField activeReleaseMask_;
     volScalarField siteStateField_;
     volScalarField alphaBirthSource_;
     volScalarField massBirthSource_;
     volScalarField latentSink_;
+
+    // Boundary value on the heater patch is the heat flux entering the
+    // interface from the closure, in W/m2: minus the boiling flux.
+    volScalarField wallBoilingFlux_;
 
     enum siteState
     {
