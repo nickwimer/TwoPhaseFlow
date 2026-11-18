@@ -10,8 +10,10 @@
 #include "Pstream.H"
 #include "PstreamReduceOps.H"
 #include "surfaceFields.H"
+#include "mathematicalConstants.H"
 
 #include <cmath>
+#include <cstdint>
 
 namespace Foam
 {
@@ -174,6 +176,61 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     (
         modelDict().lookupOrDefault<scalar>("displacementShellCells", 4.0)
     ),
+    departureDiameterDistribution_
+    (
+        modelDict().lookupOrDefault<word>
+        (
+            "departureDiameterDistribution",
+            "fixed"
+        )
+    ),
+    departureDiameterMedian_
+    (
+        modelDict().lookupOrDefault<scalar>
+        (
+            "departureDiameterMedian",
+            2.0*departureRadius_
+        )
+    ),
+    departureDiameterSigmaLn_
+    (
+        modelDict().lookupOrDefault<scalar>("departureDiameterSigmaLn", 0.0)
+    ),
+    departureDiameterMin_
+    (
+        modelDict().lookupOrDefault<scalar>
+        (
+            "departureDiameterMin",
+            2.0*departureRadius_
+        )
+    ),
+    departureDiameterMax_
+    (
+        modelDict().lookupOrDefault<scalar>
+        (
+            "departureDiameterMax",
+            2.0*departureRadius_
+        )
+    ),
+    randomSeed_(modelDict().lookupOrDefault<label>("randomSeed", 0)),
+    rearmDelayScaling_
+    (
+        modelDict().lookupOrDefault<word>("rearmDelayScaling", "fixed")
+    ),
+    waitingTimeMean_
+    (
+        modelDict().lookupOrDefault<scalar>("waitingTimeMean", 0.0)
+    ),
+    wallHeatPartition_
+    (
+        modelDict().lookupOrDefault<word>("wallHeatPartition", "vapor")
+    ),
+    evaporationFraction_
+    (
+        modelDict().lookupOrDefault<scalar>("evaporationFraction", 1.0)
+    ),
+    evaporationFractionSuperheat_(),
+    evaporationFractionValue_(),
     writeDiagnostics_
     (
         modelDict().lookupOrDefault<Switch>("writeDiagnostics", true)
@@ -202,6 +259,7 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     shieldingCells_(),
     displacementCells_(),
     captureArea_(),
+    siteDepartureRadius_(),
     targetVaporVolume_(),
     targetVaporMass_(),
     targetLatentEnergy_(),
@@ -221,6 +279,7 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     boilingEnergy_(),
     cumulativeBoilingEnergy_(),
     cumulativeBoilingBubbleEnergy_(),
+    cumulativeLiquidHeatingEnergy_(),
     cumulativeDisplacedLiquidVolume_(0.0),
     cumulativeBirthVaporVolume_(0.0),
     activeReleaseMask_
@@ -306,6 +365,20 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
         phase1.mesh(),
         dimensionedScalar("zero", dimPower/dimArea, 0.0),
         "calculated"
+    ),
+    wallLiquidHeat_
+    (
+        IOobject
+        (
+            word(diagnosticPrefix_ + "WallLiquidHeat"),
+            phase1.mesh().time().timeName(),
+            phase1.mesh(),
+            IOobject::NO_READ,
+            writeDiagnostics_ ? IOobject::AUTO_WRITE : IOobject::NO_WRITE
+        ),
+        phase1.mesh(),
+        dimensionedScalar("zero", dimPower/dimVol, 0.0),
+        "zeroGradient"
     )
 {
     if (energyOwnershipMode_ == "persistentVoronoi")
@@ -314,6 +387,13 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
             List<vector>(modelDict().lookup("energyOwnershipCentres"));
         siteOwnershipIds_ =
             labelList(modelDict().lookup("siteOwnershipIds"));
+    }
+    if (wallHeatPartition_ == "table")
+    {
+        evaporationFractionSuperheat_ =
+            scalarField(modelDict().lookup("evaporationFractionSuperheat"));
+        evaporationFractionValue_ =
+            scalarField(modelDict().lookup("evaporationFractionValue"));
     }
 
     validateControls();
@@ -336,10 +416,18 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     boilingEnergy_.setSize(nSites, 0.0);
     cumulativeBoilingEnergy_.setSize(nSites, 0.0);
     cumulativeBoilingBubbleEnergy_.setSize(nSites, 0.0);
+    cumulativeLiquidHeatingEnergy_.setSize(nSites, 0.0);
 
     forAll(nextActivationTime_, siteI)
     {
-        nextActivationTime_[siteI] = activationStagger_*siteI;
+        // Cycle 0 is the wait before a site's first activation; cycle 1 is
+        // its first release (cycleId_ is incremented on activation).
+        nextActivationTime_[siteI] =
+            activationStagger_*siteI + drawWaitingTime(siteI, 0);
+        if (departureDiameterDistribution_ != "fixed")
+        {
+            buildReleaseStencil(siteI, 0.5*drawDepartureDiameter(siteI, 1));
+        }
     }
 
     if (Pstream::master())
@@ -369,6 +457,20 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
             << ", fluxField=" << wallBoilingFluxFieldName_
             << ", displacementShellCells=" << displacementShellCells_
             << ", creationDuration=" << creationDuration_
+            << endl;
+        Info<< "populationDetachedBubbleBirth heater-dependent controls: "
+            << "departureDiameterDistribution=" << departureDiameterDistribution_
+            << ", median=" << departureDiameterMedian_
+            << ", sigmaLn=" << departureDiameterSigmaLn_
+            << ", min=" << departureDiameterMin_
+            << ", max=" << departureDiameterMax_
+            << ", randomSeed=" << randomSeed_
+            << ", rearmDelayScaling=" << rearmDelayScaling_
+            << ", waitingTimeMean=" << waitingTimeMean_
+            << ", wallHeatPartition=" << wallHeatPartition_
+            << ", evaporationFraction=" << evaporationFraction_
+            << ", evaporationFractionTablePoints="
+            << evaporationFractionSuperheat_.size()
             << endl;
     }
 }
@@ -594,6 +696,105 @@ void Foam::populationDetachedBubbleBirth::validateControls() const
             << wallBoilingFluxMode_
             << exit(FatalError);
     }
+    if
+    (
+        departureDiameterDistribution_ != "fixed"
+     && departureDiameterDistribution_ != "logNormal"
+    )
+    {
+        FatalErrorInFunction
+            << "departureDiameterDistribution must be fixed or logNormal; "
+            << "found " << departureDiameterDistribution_
+            << exit(FatalError);
+    }
+    if
+    (
+        departureDiameterDistribution_ == "logNormal"
+     && (
+            departureDiameterMin_ <= 0
+         || departureDiameterMax_ < departureDiameterMin_
+         || departureDiameterMedian_ <= 0
+         || departureDiameterSigmaLn_ < 0
+        )
+    )
+    {
+        FatalErrorInFunction
+            << "logNormal departure diameters need 0 < departureDiameterMin"
+            << " <= departureDiameterMax, departureDiameterMedian > 0 and"
+            << " departureDiameterSigmaLn >= 0; found min="
+            << departureDiameterMin_ << " max=" << departureDiameterMax_
+            << " median=" << departureDiameterMedian_
+            << " sigmaLn=" << departureDiameterSigmaLn_
+            << exit(FatalError);
+    }
+    if (rearmDelayScaling_ != "fixed" && rearmDelayScaling_ != "diameter")
+    {
+        FatalErrorInFunction
+            << "rearmDelayScaling must be fixed or diameter; found "
+            << rearmDelayScaling_
+            << exit(FatalError);
+    }
+    if (waitingTimeMean_ < 0)
+    {
+        FatalErrorInFunction
+            << "waitingTimeMean must be non-negative; found "
+            << waitingTimeMean_
+            << exit(FatalError);
+    }
+    if
+    (
+        wallHeatPartition_ != "vapor"
+     && wallHeatPartition_ != "constant"
+     && wallHeatPartition_ != "table"
+    )
+    {
+        FatalErrorInFunction
+            << "wallHeatPartition must be vapor, constant or table; found "
+            << wallHeatPartition_
+            << exit(FatalError);
+    }
+    if (wallHeatPartition_ != "vapor" && wallBoilingClosure_ == "none")
+    {
+        FatalErrorInFunction
+            << "wallHeatPartition " << wallHeatPartition_
+            << " needs the wall boiling closure"
+            << exit(FatalError);
+    }
+    if
+    (
+        wallHeatPartition_ == "constant"
+     && (evaporationFraction_ < 0 || evaporationFraction_ > 1)
+    )
+    {
+        FatalErrorInFunction
+            << "evaporationFraction must lie in [0, 1]; found "
+            << evaporationFraction_
+            << exit(FatalError);
+    }
+    if (wallHeatPartition_ == "table")
+    {
+        const label n = evaporationFractionSuperheat_.size();
+        bool valid = n >= 2 && evaporationFractionValue_.size() == n;
+        for (label i = 0; valid && i < n; ++i)
+        {
+            valid =
+                evaporationFractionValue_[i] >= 0
+             && evaporationFractionValue_[i] <= 1
+             && (
+                    i == 0
+                 || evaporationFractionSuperheat_[i]
+                  > evaporationFractionSuperheat_[i - 1]
+                );
+        }
+        if (!valid)
+        {
+            FatalErrorInFunction
+                << "wallHeatPartition table needs at least two points, "
+                << "evaporationFractionSuperheat increasing and "
+                << "evaporationFractionValue of the same length in [0, 1]"
+                << exit(FatalError);
+        }
+    }
     if (maximumHandoffDuration_ != -1.0 && maximumHandoffDuration_ <= 0)
     {
         FatalErrorInFunction
@@ -663,10 +864,8 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
         }
     }
 
-    tmp<volScalarField> tRhoV = phase2_.thermo().rho();
-    const volScalarField& rhoV = tRhoV();
-
     const label nSites = siteCentres_.size();
+    siteDepartureRadius_.setSize(nSites, departureRadius_);
     siteFaceLabels_.setSize(nSites);
     sphereCells_.setSize(nSites);
     sphereTargetVapor_.setSize(nSites);
@@ -722,8 +921,65 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
                 << endl;
         }
 
+        buildReleaseStencil(siteI, departureRadius_);
+
+        DynamicList<label> localShieldCells;
+        forAll(mesh.C(), celli)
+        {
+            const vector d = mesh.C()[celli] - site;
+            const scalar radial = Foam::sqrt(sqr(d.x()) + sqr(d.y()));
+            if
+            (
+                d.z() >= -SMALL
+             && d.z() <= shieldingHeight_ + SMALL
+             && radial <= shieldingRadius_ + SMALL
+            )
+            {
+                localShieldCells.append(celli);
+            }
+        }
+        shieldingCells_[siteI].transfer(localShieldCells);
+
+        label globalFaceCount = siteFaceLabels_[siteI].size();
+        label globalShieldCount = shieldingCells_[siteI].size();
+        reduce(globalFaceCount, sumOp<label>());
+        reduce(globalShieldCount, sumOp<label>());
+
+        if
+        (
+            globalFaceCount == 0
+         || globalShieldCount == 0
+         || localCaptureArea <= SMALL
+        )
+        {
+            FatalErrorInFunction
+                << "Site " << siteI << " at " << site
+                << " has an invalid capture or shielding stencil"
+                << exit(FatalError);
+        }
+    }
+}
+
+void Foam::populationDetachedBubbleBirth::buildReleaseStencil
+(
+    const label siteI,
+    const scalar radius
+)
+{
+    // The cells a site's bubble is created in, their target vapor fractions,
+    // the latent heat that bubble needs, and the liquid shell that receives
+    // the liquid it displaces, for a bubble of the given radius. Every
+    // processor must call this for the same site at the same time: it ends
+    // with global reductions.
+    const fvMesh& mesh = phase1_.mesh();
+    tmp<volScalarField> tRhoV = phase2_.thermo().rho();
+    const volScalarField& rhoV = tRhoV();
+    const vector& site = siteCentres_[siteI];
+    siteDepartureRadius_[siteI] = radius;
+
+    {
         const vector bubbleCentre =
-            site + vector(0, 0, departureRadius_ + detachmentGap_);
+            site + vector(0, 0, radius + detachmentGap_);
         DynamicList<label> localSphereCells;
         DynamicList<label> localDisplacementCells;
         DynamicList<scalar> localTargets;
@@ -738,7 +994,7 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
             const scalar interfaceWidth =
                 max(interfaceWidthCells_*cellSize, scalar(SMALL));
             const scalar signedDistance =
-                departureRadius_ - mag(mesh.C()[celli] - bubbleCentre);
+                radius - mag(mesh.C()[celli] - bubbleCentre);
             const scalar profile = min
             (
                 max
@@ -764,7 +1020,7 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
             (
                 continuitySourceMode_ == "displacedLiquid"
              && mag(mesh.C()[celli] - bubbleCentre)
-             <= departureRadius_ + displacementShellCells_*cellSize
+             <= radius + displacementShellCells_*cellSize
             )
             {
                 // Liquid just outside the new bubble. It receives the
@@ -788,30 +1044,8 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
         targetVaporMass_[siteI] = localMass;
         targetLatentEnergy_[siteI] = localLatent;
 
-        DynamicList<label> localShieldCells;
-        forAll(mesh.C(), celli)
-        {
-            const vector d = mesh.C()[celli] - site;
-            const scalar radial = Foam::sqrt(sqr(d.x()) + sqr(d.y()));
-            if
-            (
-                d.z() >= -SMALL
-             && d.z() <= shieldingHeight_ + SMALL
-             && radial <= shieldingRadius_ + SMALL
-            )
-            {
-                localShieldCells.append(celli);
-            }
-        }
-        shieldingCells_[siteI].transfer(localShieldCells);
-
-        label globalFaceCount = siteFaceLabels_[siteI].size();
         label globalSphereCount = sphereCells_[siteI].size();
-        label globalShieldCount = shieldingCells_[siteI].size();
-        reduce(globalFaceCount, sumOp<label>());
         reduce(globalSphereCount, sumOp<label>());
-        reduce(globalShieldCount, sumOp<label>());
-
         label globalDisplacementCount = displacementCells_[siteI].size();
         reduce(globalDisplacementCount, sumOp<label>());
         if
@@ -829,10 +1063,7 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
 
         if
         (
-            globalFaceCount == 0
-         || globalSphereCount == 0
-         || globalShieldCount == 0
-         || localCaptureArea <= SMALL
+            globalSphereCount == 0
          || localVolume <= SMALL
          || localLatent <= SMALL
          || localCoreCells == 0
@@ -840,10 +1071,122 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
         {
             FatalErrorInFunction
                 << "Site " << siteI << " at " << site
-                << " has an invalid capture, release, or shielding stencil"
+                << " has an invalid release stencil for a bubble of radius "
+                << radius << ": cells=" << globalSphereCount
+                << " volume=" << localVolume
+                << " coreCells=" << localCoreCells
                 << exit(FatalError);
         }
     }
+}
+
+Foam::scalar Foam::populationDetachedBubbleBirth::hashUniform
+(
+    const label siteI,
+    const label cycle,
+    const label stream
+) const
+{
+    // SplitMix64 over (seed, site, cycle, stream): a uniform number in
+    // (0, 1) that every processor computes identically.
+    auto mix = [](uint64_t x)
+    {
+        x += 0x9E3779B97F4A7C15ULL;
+        x = (x ^ (x >> 30))*0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27))*0x94D049BB133111EBULL;
+        return x ^ (x >> 31);
+    };
+    uint64_t h = mix(static_cast<uint64_t>(randomSeed_));
+    h = mix(h ^ static_cast<uint64_t>(siteI));
+    h = mix(h ^ static_cast<uint64_t>(cycle));
+    h = mix(h ^ static_cast<uint64_t>(stream));
+    // The top 53 bits, shifted off zero and one.
+    return (static_cast<scalar>(h >> 11) + 1.0)/9007199254740994.0;
+}
+
+Foam::scalar Foam::populationDetachedBubbleBirth::drawDepartureDiameter
+(
+    const label siteI,
+    const label cycle
+) const
+{
+    if (departureDiameterDistribution_ == "fixed")
+    {
+        return 2.0*departureRadius_;
+    }
+    // Log-normal by Box-Muller, redrawn (on fresh streams) until the value
+    // lies in [min, max].
+    for (label attempt = 0; attempt < 64; ++attempt)
+    {
+        const scalar u1 = hashUniform(siteI, cycle, 2*attempt + 1);
+        const scalar u2 = hashUniform(siteI, cycle, 2*attempt + 2);
+        const scalar z =
+            Foam::sqrt(-2.0*Foam::log(u1))
+           *Foam::cos(constant::mathematical::twoPi*u2);
+        const scalar d =
+            departureDiameterMedian_*Foam::exp(departureDiameterSigmaLn_*z);
+        if (d >= departureDiameterMin_ && d <= departureDiameterMax_)
+        {
+            return d;
+        }
+    }
+    return min(max(departureDiameterMedian_, departureDiameterMin_), departureDiameterMax_);
+}
+
+Foam::scalar Foam::populationDetachedBubbleBirth::drawWaitingTime
+(
+    const label siteI,
+    const label cycle
+) const
+{
+    if (waitingTimeMean_ <= 0)
+    {
+        return 0;
+    }
+    return -waitingTimeMean_*Foam::log(hashUniform(siteI, cycle, 1000));
+}
+
+Foam::scalar Foam::populationDetachedBubbleBirth::rearmDelay
+(
+    const label siteI
+) const
+{
+    if (rearmDelayScaling_ == "diameter")
+    {
+        return minimumRearmDelay_*siteDepartureRadius_[siteI]/departureRadius_;
+    }
+    return minimumRearmDelay_;
+}
+
+Foam::scalar Foam::populationDetachedBubbleBirth::siteEvaporationFraction
+(
+    const scalar superheat
+) const
+{
+    if (wallHeatPartition_ == "constant")
+    {
+        return evaporationFraction_;
+    }
+    if (wallHeatPartition_ == "table")
+    {
+        const scalarField& x = evaporationFractionSuperheat_;
+        const scalarField& y = evaporationFractionValue_;
+        const label n = x.size();
+        if (superheat <= x[0])
+        {
+            return y[0];
+        }
+        for (label i = 1; i < n; ++i)
+        {
+            if (superheat <= x[i])
+            {
+                const scalar w = (superheat - x[i - 1])/(x[i] - x[i - 1]);
+                return (1 - w)*y[i - 1] + w*y[i];
+            }
+        }
+        return y[n - 1];
+    }
+    return 1;
 }
 
 void Foam::populationDetachedBubbleBirth::resetSite
@@ -863,7 +1206,19 @@ void Foam::populationDetachedBubbleBirth::resetSite
     creationStartTime_[siteI] = -GREAT;
     initialSensibleCredit_[siteI] = 0.0;
     chargedWallEnergy_[siteI] = 0.0;
-    nextActivationTime_[siteI] = timeValue + minimumRearmDelay_;
+    // The delay follows the bubble just released (or abandoned). The
+    // release stencil is then rebuilt for the next cycle's bubble, so that
+    // everything the site measures while it waits and charges refers to it.
+    nextActivationTime_[siteI] =
+        timeValue + rearmDelay(siteI) + drawWaitingTime(siteI, cycleId_[siteI]);
+    if (departureDiameterDistribution_ != "fixed")
+    {
+        buildReleaseStencil
+        (
+            siteI,
+            0.5*drawDepartureDiameter(siteI, cycleId_[siteI] + 1)
+        );
+    }
 }
 
 void Foam::populationDetachedBubbleBirth::updateSources()
@@ -881,6 +1236,7 @@ void Foam::populationDetachedBubbleBirth::updateSources()
     alphaBirthSource_ *= scalar(0);
     massBirthSource_ *= scalar(0);
     latentSink_ *= scalar(0);
+    wallLiquidHeat_ *= scalar(0);
 
     const scalar timeValue = mesh.time().value();
     const scalar deltaT = max(mesh.time().deltaTValue(), scalar(VSMALL));
@@ -912,6 +1268,8 @@ void Foam::populationDetachedBubbleBirth::updateSources()
     boilingFluxPatch = scalar(0);
     scalar totalBoilingPower = 0;
     scalar totalConductionPower = 0;
+    scalar totalLiquidHeatingPower = 0;
+    const bool partitioned = wallHeatPartition_ != "vapor";
     const bool diagnosticsStep =
         timeIndex % diagnosticsInterval_ == 0 || mesh.time().writeTime();
 
@@ -947,6 +1305,9 @@ void Foam::populationDetachedBubbleBirth::updateSources()
         // balance does not depend on when the next bubble may form.
         scalar localBoilingPower = 0;
         scalar localConductionPower = 0;
+        scalar localLiquidHeatingPower = 0;
+        const scalar evaporationFraction =
+            siteEvaporationFraction(meanWallSuperheat);
         if
         (
             boilingClosure
@@ -982,15 +1343,38 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 boilingFluxPatch[faceI] = -boilingFlux;
                 localBoilingPower += boilingFlux*area;
                 localConductionPower += conductionFlux*area;
+
+                // Wall heat partition: the share that does not form
+                // bubbles at the wall heats the liquid of the wall cell,
+                // but only while that liquid is cooler than the wall.
+                if
+                (
+                    partitioned
+                 && evaporationFraction < 1
+                 && liquidTemperature[celli] < wallTemperature[faceI]
+                )
+                {
+                    const scalar liquidPower =
+                        (1 - evaporationFraction)*boilingFlux*area;
+                    wallLiquidHeat_[celli] += liquidPower/mesh.V()[celli];
+                    localLiquidHeatingPower += liquidPower;
+                }
             }
             reduce(localBoilingPower, sumOp<scalar>());
             reduce(localConductionPower, sumOp<scalar>());
+            if (partitioned)
+            {
+                reduce(localLiquidHeatingPower, sumOp<scalar>());
+            }
 
             const scalar boilingEnergyStep = localBoilingPower*deltaT;
-            boilingEnergy_[siteI] += boilingEnergyStep;
+            const scalar liquidEnergyStep = localLiquidHeatingPower*deltaT;
+            boilingEnergy_[siteI] += boilingEnergyStep - liquidEnergyStep;
             cumulativeBoilingEnergy_[siteI] += boilingEnergyStep;
+            cumulativeLiquidHeatingEnergy_[siteI] += liquidEnergyStep;
             totalBoilingPower += localBoilingPower;
             totalConductionPower += localConductionPower;
+            totalLiquidHeatingPower += localLiquidHeatingPower;
         }
 
         scalar localShieldVapor = 0;
@@ -1344,7 +1728,7 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                         << " cycle=" << cycleId_[siteI]
                         << " time=" << timeValue
                         << " centre=" << siteCentres_[siteI]
-                        << " departureRadius=" << departureRadius_
+                        << " departureRadius=" << siteDepartureRadius_[siteI]
                         << " completion="
                         << (latentBudgetComplete ? "latentBudget" : "stencil")
                         << " createdVaporVolume="
@@ -1576,7 +1960,7 @@ void Foam::populationDetachedBubbleBirth::updateSources()
             (
                 !shielded
              && timeValue - releaseTime_[siteI] + SMALL
-                >= minimumRearmDelay_
+                >= rearmDelay(siteI)
             )
             {
                 resetSite(siteI, timeValue);
@@ -1638,6 +2022,11 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                     << cumulativeBoilingEnergy_[siteI]
                     << " cumulativeBubbleEnergy="
                     << cumulativeBoilingBubbleEnergy_[siteI]
+                    << " evaporationFraction=" << evaporationFraction
+                    << " liquidHeatingPower=" << localLiquidHeatingPower
+                    << " cumulativeLiquidHeatingEnergy="
+                    << cumulativeLiquidHeatingEnergy_[siteI]
+                    << " departureRadius=" << siteDepartureRadius_[siteI]
                     << endl;
             }
         }
@@ -1655,6 +2044,9 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 << " cumulativeBubbleEnergy="
                 << sum(cumulativeBoilingBubbleEnergy_)
                 << " storedBoilingEnergy=" << sum(boilingEnergy_)
+                << " liquidHeatingPower=" << totalLiquidHeatingPower
+                << " cumulativeLiquidHeatingEnergy="
+                << sum(cumulativeLiquidHeatingEnergy_)
                 << endl;
         }
         if (continuitySourceMode_ == "displacedLiquid")
@@ -1673,6 +2065,7 @@ void Foam::populationDetachedBubbleBirth::updateSources()
     alphaBirthSource_.correctBoundaryConditions();
     massBirthSource_.correctBoundaryConditions();
     latentSink_.correctBoundaryConditions();
+    wallLiquidHeat_.correctBoundaryConditions();
 }
 
 void Foam::populationDetachedBubbleBirth::TSource1
@@ -1681,8 +2074,11 @@ void Foam::populationDetachedBubbleBirth::TSource1
 )
 {
     updateSources();
+    // Latent heat of bubbles not paid for by the wall leaves the liquid; the
+    // wall heat partition's share of the boiling heat enters it.
     T1Eqn.source() -=
-        latentSink_.internalField()*phase1_.mesh().V();
+        (latentSink_.internalField() - wallLiquidHeat_.internalField())
+       *phase1_.mesh().V();
 }
 
 void Foam::populationDetachedBubbleBirth::TSource2

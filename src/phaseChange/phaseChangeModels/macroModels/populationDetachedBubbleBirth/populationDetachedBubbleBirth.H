@@ -82,6 +82,44 @@ private:
     // displacedLiquid).
     scalar displacementShellCells_;
 
+    // Size of each released bubble. "fixed" (default) releases bubbles of
+    // diameter 2*departureRadius. "logNormal" gives every release its own
+    // diameter, drawn when the site rearms from a log-normal distribution
+    // with median departureDiameterMedian and standard deviation of ln(D)
+    // departureDiameterSigmaLn, redrawn until it lies in
+    // [departureDiameterMin, departureDiameterMax]. The draw depends only on
+    // (randomSeed, site, cycle), so every processor gets the same value
+    // without communication. The site's release stencil and latent target
+    // are rebuilt for that diameter, so the energy balance stays exact.
+    word departureDiameterDistribution_;
+    scalar departureDiameterMedian_;
+    scalar departureDiameterSigmaLn_;
+    scalar departureDiameterMin_;
+    scalar departureDiameterMax_;
+    label randomSeed_;
+
+    // Release timing. rearmDelayScaling "diameter" scales minimumRearmDelay
+    // by the last released diameter over 2*departureRadius, so a small
+    // bubble clears its site sooner. waitingTimeMean > 0 adds an
+    // exponentially distributed wait, drawn like the diameter, before a site
+    // may activate again. Boiling energy keeps accumulating while a site
+    // waits, so the scatter moves releases in time without losing energy.
+    word rearmDelayScaling_;
+    scalar waitingTimeMean_;
+
+    // Share of an active site's boiling heat that funds its bubbles.
+    // "vapor" (default): all of it, the original model. "constant": the
+    // fraction evaporationFraction. "table": interpolated at the site's mean
+    // wall superheat from evaporationFractionSuperheat/Value (clamped at the
+    // ends). The rest heats the liquid in the wall cells of the site's
+    // faces, but only while that liquid is cooler than the wall; otherwise
+    // it too funds the site's bubbles, so the closure never heats the liquid
+    // above the wall temperature and every joule still lands somewhere.
+    word wallHeatPartition_;
+    scalar evaporationFraction_;
+    scalarField evaporationFractionSuperheat_;
+    scalarField evaporationFractionValue_;
+
     Switch writeDiagnostics_;
     Switch writeHandoffAudit_;
     word diagnosticPrefix_;
@@ -97,6 +135,8 @@ private:
     List<labelList> displacementCells_;
 
     scalarField captureArea_;
+    // Radius of the bubble each site will release next (or is releasing).
+    scalarField siteDepartureRadius_;
     scalarField targetVaporVolume_;
     scalarField targetVaporMass_;
     scalarField targetLatentEnergy_;
@@ -116,12 +156,18 @@ private:
     scalarField createdVaporMass_;
     scalarField consumedLatentEnergy_;
 
-    // Energy removed from the solid by the wall boiling closure and not yet
-    // turned into vapor. It is never reset: every joule taken from the
-    // heater must reappear as latent heat of a bubble.
+    // Energy removed from the solid by the wall boiling closure that funds
+    // bubbles and is not yet turned into vapor. It is never reset: every
+    // joule of it must reappear as latent heat of a bubble.
+    // cumulativeBoilingEnergy_ is all the closure has taken from the solid;
+    // cumulativeLiquidHeatingEnergy_ is the part of it the wall heat
+    // partition gave to the liquid instead, so that
+    //     cumulativeBoilingEnergy = cumulativeBubbleEnergy
+    //                             + boilingEnergy + cumulativeLiquidHeating.
     scalarField boilingEnergy_;
     scalarField cumulativeBoilingEnergy_;
     scalarField cumulativeBoilingBubbleEnergy_;
+    scalarField cumulativeLiquidHeatingEnergy_;
     scalar cumulativeDisplacedLiquidVolume_;
     scalar cumulativeBirthVaporVolume_;
 
@@ -135,6 +181,10 @@ private:
     // interface from the closure, in W/m2: minus the boiling flux.
     volScalarField wallBoilingFlux_;
 
+    // Heat the wall heat partition puts into the liquid of the wall cells,
+    // W/m3. Added to the liquid energy equation with the latent sink.
+    volScalarField wallLiquidHeat_;
+
     enum siteState
     {
         WAITING_FOR_ACTIVATION = 0,
@@ -145,6 +195,17 @@ private:
 
     void validateControls() const;
     void buildSiteStencils();
+    void buildReleaseStencil(const label siteI, const scalar radius);
+    scalar hashUniform
+    (
+        const label siteI,
+        const label cycle,
+        const label stream
+    ) const;
+    scalar drawDepartureDiameter(const label siteI, const label cycle) const;
+    scalar drawWaitingTime(const label siteI, const label cycle) const;
+    scalar rearmDelay(const label siteI) const;
+    scalar siteEvaporationFraction(const scalar superheat) const;
     scalar TSat(const label celli) const;
     const char* stateName(const label state) const;
     void resetSite(const label siteI, const scalar timeValue);
