@@ -128,6 +128,11 @@ private:
     // goes into the liquid of the wall cells, while that liquid is cooler
     // than the wall; a face whose liquid is not cooler carries no closure
     // flux. The inactive site's bubble energy is not charged.
+    // "liquidThenNearestSite": the same, except that where the liquid is not
+    // cooler the face keeps the law's flux and its heat funds the bubbles of
+    // the nearest active site (in the heater plane), booked there in the same
+    // step. So the whole heater always carries the law while any site is
+    // active. These faces are handled in a pass before the site loop.
     word inactiveAreaHeat_;
 
     Switch writeDiagnostics_;

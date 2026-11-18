@@ -765,10 +765,16 @@ void Foam::populationDetachedBubbleBirth::validateControls() const
             << " needs the wall boiling closure"
             << exit(FatalError);
     }
-    if (inactiveAreaHeat_ != "none" && inactiveAreaHeat_ != "liquid")
+    if
+    (
+        inactiveAreaHeat_ != "none"
+     && inactiveAreaHeat_ != "liquid"
+     && inactiveAreaHeat_ != "liquidThenNearestSite"
+    )
     {
         FatalErrorInFunction
-            << "inactiveAreaHeat must be none or liquid; found "
+            << "inactiveAreaHeat must be none, liquid or "
+            << "liquidThenNearestSite; found "
             << inactiveAreaHeat_
             << exit(FatalError);
     }
@@ -978,7 +984,7 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
         }
     }
 
-    if (inactiveAreaHeat_ == "liquid")
+    if (inactiveAreaHeat_ != "none")
     {
         // The option covers the faces sites own. Report how much of the
         // heater that is, so a gap (capture radii, or ownership centres
@@ -1305,6 +1311,121 @@ void Foam::populationDetachedBubbleBirth::updateSources()
     const bool diagnosticsStep =
         timeIndex % diagnosticsInterval_ == 0 || mesh.time().writeTime();
 
+    // inactiveAreaHeat liquidThenNearestSite: the faces of inactive sites are
+    // handled here, before the site loop, so that the heat their wall-cell
+    // liquid cannot take reaches the nearest active site in this same step.
+    // The law is the same as in the site loop below.
+    const label nSites = siteCentres_.size();
+    const bool nearestSiteOverflow =
+        boilingClosure && inactiveAreaHeat_ == "liquidThenNearestSite";
+    const label nPrepass = nearestSiteOverflow ? nSites : 0;
+    boolList prepassActive(nPrepass, false);
+    scalarField inactiveLiquidPower(nPrepass, 0.0);
+    scalarField inactiveConductionPower(nPrepass, 0.0);
+    scalarField receivedPower(nPrepass, 0.0);
+    if (nearestSiteOverflow)
+    {
+        forAll(siteCentres_, siteI)
+        {
+            scalar superheatArea = 0;
+            scalar siteArea = 0;
+            const labelList& faces = siteFaceLabels_[siteI];
+            forAll(faces, faceListI)
+            {
+                const label faceI = faces[faceListI];
+                const scalar area = mag(faceAreaVectors[faceI]);
+                superheatArea +=
+                    max(wallTemperature[faceI] - TSat(faceCells[faceI]), scalar(0))
+                   *area;
+                siteArea += area;
+            }
+            reduce(superheatArea, sumOp<scalar>());
+            reduce(siteArea, sumOp<scalar>());
+            const scalar meanSuperheat =
+                siteArea > SMALL ? superheatArea/siteArea : scalar(0);
+            prepassActive[siteI] =
+                meanSuperheat + SMALL >= siteActivationSuperheat_[siteI];
+        }
+
+        forAll(siteCentres_, siteI)
+        {
+            if (prepassActive[siteI])
+            {
+                continue;
+            }
+            // Nearest active site in the heater plane; -1 if none is active.
+            label targetI = -1;
+            scalar nearestDistanceSqr = GREAT;
+            forAll(siteCentres_, otherI)
+            {
+                if (!prepassActive[otherI])
+                {
+                    continue;
+                }
+                const vector d = siteCentres_[otherI] - siteCentres_[siteI];
+                const scalar distanceSqr = sqr(d.x()) + sqr(d.y());
+                if (distanceSqr < nearestDistanceSqr)
+                {
+                    nearestDistanceSqr = distanceSqr;
+                    targetI = otherI;
+                }
+            }
+
+            scalar liquidPower = 0;
+            scalar overflowPower = 0;
+            scalar conductionPower = 0;
+            const labelList& faces = siteFaceLabels_[siteI];
+            forAll(faces, faceListI)
+            {
+                const label faceI = faces[faceListI];
+                const label celli = faceCells[faceI];
+                const scalar area = mag(faceAreaVectors[faceI]);
+                const scalar superheat =
+                    max(wallTemperature[faceI] - TSat(celli), scalar(0));
+                const scalar conductionFlux =
+                    max(kappaPatch[faceI]*snGrad[faceI], scalar(0));
+                scalar lawFlux =
+                    wallBoilingCoefficient_
+                   *Foam::pow(superheat, wallBoilingExponent_);
+                if (wallBoilingMaxFlux_ > 0)
+                {
+                    lawFlux = min(lawFlux, wallBoilingMaxFlux_);
+                }
+                scalar boilingFlux =
+                    wallBoilingFluxMode_ == "total"
+                  ? max(lawFlux - conductionFlux, scalar(0))
+                  : lawFlux;
+                boilingFlux *=
+                    max(min(phase1_[celli], scalar(1)), scalar(0));
+                conductionPower += conductionFlux*area;
+
+                if (liquidTemperature[celli] < wallTemperature[faceI])
+                {
+                    // The wall-cell liquid takes the heat.
+                    boilingFluxPatch[faceI] = -boilingFlux;
+                    wallLiquidHeat_[celli] += boilingFlux*area/mesh.V()[celli];
+                    liquidPower += boilingFlux*area;
+                }
+                else if (targetI >= 0)
+                {
+                    // The liquid is full: the heat funds the bubbles of the
+                    // nearest active site instead.
+                    boilingFluxPatch[faceI] = -boilingFlux;
+                    overflowPower += boilingFlux*area;
+                }
+            }
+            reduce(liquidPower, sumOp<scalar>());
+            reduce(overflowPower, sumOp<scalar>());
+            reduce(conductionPower, sumOp<scalar>());
+            inactiveLiquidPower[siteI] = liquidPower;
+            inactiveConductionPower[siteI] = conductionPower;
+            if (targetI >= 0)
+            {
+                receivedPower[targetI] += overflowPower;
+            }
+        }
+    }
+
     forAll(siteCentres_, siteI)
     {
         scalar localSuperheatArea = 0;
@@ -1340,16 +1461,36 @@ void Foam::populationDetachedBubbleBirth::updateSources()
         scalar localLiquidHeatingPower = 0;
         const bool siteActive =
             boilingClosure
-         && meanWallSuperheat + SMALL >= siteActivationSuperheat_[siteI];
+         && (
+                nearestSiteOverflow
+              ? bool(prepassActive[siteI])
+              : meanWallSuperheat + SMALL >= siteActivationSuperheat_[siteI]
+            );
         // Below its activation superheat the site's area may still carry the
         // law, with all of its heat going to the liquid (inactiveAreaHeat).
         const bool inactiveToLiquid =
             boilingClosure && !siteActive && inactiveAreaHeat_ == "liquid";
+        // liquidThenNearestSite: done before the loop; book it here.
+        const bool inactiveFromPrepass = nearestSiteOverflow && !siteActive;
         const scalar evaporationFraction =
-            inactiveToLiquid
+            inactiveToLiquid || inactiveFromPrepass
           ? scalar(0)
           : siteEvaporationFraction(meanWallSuperheat);
-        if (siteActive || inactiveToLiquid)
+        if (inactiveFromPrepass)
+        {
+            // Only the liquid's share belongs to this site; what its liquid
+            // could not take is booked at the active site that received it.
+            localBoilingPower = inactiveLiquidPower[siteI];
+            localLiquidHeatingPower = inactiveLiquidPower[siteI];
+            localConductionPower = inactiveConductionPower[siteI];
+            const scalar liquidEnergyStep = localLiquidHeatingPower*deltaT;
+            cumulativeBoilingEnergy_[siteI] += liquidEnergyStep;
+            cumulativeLiquidHeatingEnergy_[siteI] += liquidEnergyStep;
+            totalBoilingPower += localBoilingPower;
+            totalConductionPower += localConductionPower;
+            totalLiquidHeatingPower += localLiquidHeatingPower;
+        }
+        else if (siteActive || inactiveToLiquid)
         {
             forAll(faces, faceListI)
             {
@@ -1420,6 +1561,12 @@ void Foam::populationDetachedBubbleBirth::updateSources()
             if (partitioned || inactiveToLiquid)
             {
                 reduce(localLiquidHeatingPower, sumOp<scalar>());
+            }
+            // Heat that the liquid over nearby inactive sites could not take
+            // funds this site's bubbles (liquidThenNearestSite).
+            if (nearestSiteOverflow)
+            {
+                localBoilingPower += receivedPower[siteI];
             }
 
             const scalar boilingEnergyStep = localBoilingPower*deltaT;
@@ -2081,8 +2228,12 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                     << " liquidHeatingPower=" << localLiquidHeatingPower
                     << " cumulativeLiquidHeatingEnergy="
                     << cumulativeLiquidHeatingEnergy_[siteI]
-                    << " departureRadius=" << siteDepartureRadius_[siteI]
-                    << endl;
+                    << " departureRadius=" << siteDepartureRadius_[siteI];
+                if (nearestSiteOverflow)
+                {
+                    Info<< " receivedPower=" << receivedPower[siteI];
+                }
+                Info<< endl;
             }
         }
     }
