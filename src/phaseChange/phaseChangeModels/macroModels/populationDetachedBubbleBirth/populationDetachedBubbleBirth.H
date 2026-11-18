@@ -120,6 +120,16 @@ private:
     scalarField evaporationFractionSuperheat_;
     scalarField evaporationFractionValue_;
 
+    // Heater area of sites below their activation superheat. "none"
+    // (default): it carries no closure flux, the original model, so the wall
+    // there warms until the site activates. With a fitted wall law (Cooper),
+    // which already averages over the site density, that counts the density
+    // twice. "liquid": the closure law applies there too and all of its heat
+    // goes into the liquid of the wall cells, while that liquid is cooler
+    // than the wall; a face whose liquid is not cooler carries no closure
+    // flux. The inactive site's bubble energy is not charged.
+    word inactiveAreaHeat_;
+
     Switch writeDiagnostics_;
     Switch writeHandoffAudit_;
     word diagnosticPrefix_;

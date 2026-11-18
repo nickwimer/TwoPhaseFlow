@@ -231,6 +231,10 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     ),
     evaporationFractionSuperheat_(),
     evaporationFractionValue_(),
+    inactiveAreaHeat_
+    (
+        modelDict().lookupOrDefault<word>("inactiveAreaHeat", "none")
+    ),
     writeDiagnostics_
     (
         modelDict().lookupOrDefault<Switch>("writeDiagnostics", true)
@@ -471,6 +475,7 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
             << ", evaporationFraction=" << evaporationFraction_
             << ", evaporationFractionTablePoints="
             << evaporationFractionSuperheat_.size()
+            << ", inactiveAreaHeat=" << inactiveAreaHeat_
             << endl;
     }
 }
@@ -760,6 +765,20 @@ void Foam::populationDetachedBubbleBirth::validateControls() const
             << " needs the wall boiling closure"
             << exit(FatalError);
     }
+    if (inactiveAreaHeat_ != "none" && inactiveAreaHeat_ != "liquid")
+    {
+        FatalErrorInFunction
+            << "inactiveAreaHeat must be none or liquid; found "
+            << inactiveAreaHeat_
+            << exit(FatalError);
+    }
+    if (inactiveAreaHeat_ != "none" && wallBoilingClosure_ == "none")
+    {
+        FatalErrorInFunction
+            << "inactiveAreaHeat " << inactiveAreaHeat_
+            << " needs the wall boiling closure"
+            << exit(FatalError);
+    }
     if
     (
         wallHeatPartition_ == "constant"
@@ -957,6 +976,19 @@ void Foam::populationDetachedBubbleBirth::buildSiteStencils()
                 << " has an invalid capture or shielding stencil"
                 << exit(FatalError);
         }
+    }
+
+    if (inactiveAreaHeat_ == "liquid")
+    {
+        // The option covers the faces sites own. Report how much of the
+        // heater that is, so a gap (capture radii, or ownership centres
+        // without a CFD site) shows up in the log.
+        const scalar heaterArea = gSum(mag(faceAreaVectors));
+        Info<< "POPULATION_INACTIVE_AREA_HEAT"
+            << " mode=" << inactiveAreaHeat_
+            << " siteArea=" << sum(captureArea_)
+            << " heaterArea=" << heaterArea
+            << endl;
     }
 }
 
@@ -1306,13 +1338,18 @@ void Foam::populationDetachedBubbleBirth::updateSources()
         scalar localBoilingPower = 0;
         scalar localConductionPower = 0;
         scalar localLiquidHeatingPower = 0;
-        const scalar evaporationFraction =
-            siteEvaporationFraction(meanWallSuperheat);
-        if
-        (
+        const bool siteActive =
             boilingClosure
-         && meanWallSuperheat + SMALL >= siteActivationSuperheat_[siteI]
-        )
+         && meanWallSuperheat + SMALL >= siteActivationSuperheat_[siteI];
+        // Below its activation superheat the site's area may still carry the
+        // law, with all of its heat going to the liquid (inactiveAreaHeat).
+        const bool inactiveToLiquid =
+            boilingClosure && !siteActive && inactiveAreaHeat_ == "liquid";
+        const scalar evaporationFraction =
+            inactiveToLiquid
+          ? scalar(0)
+          : siteEvaporationFraction(meanWallSuperheat);
+        if (siteActive || inactiveToLiquid)
         {
             forAll(faces, faceListI)
             {
@@ -1340,6 +1377,24 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 boilingFlux *=
                     max(min(phase1_[celli], scalar(1)), scalar(0));
 
+                if (inactiveToLiquid)
+                {
+                    // Inactive area: the heat goes to the liquid of the wall
+                    // cell, and only while that liquid is cooler than the
+                    // wall. There is no bubble to send it to otherwise, so
+                    // the face then carries no closure flux at all.
+                    localConductionPower += conductionFlux*area;
+                    if (liquidTemperature[celli] < wallTemperature[faceI])
+                    {
+                        const scalar liquidPower = boilingFlux*area;
+                        boilingFluxPatch[faceI] = -boilingFlux;
+                        wallLiquidHeat_[celli] += liquidPower/mesh.V()[celli];
+                        localBoilingPower += liquidPower;
+                        localLiquidHeatingPower += liquidPower;
+                    }
+                    continue;
+                }
+
                 boilingFluxPatch[faceI] = -boilingFlux;
                 localBoilingPower += boilingFlux*area;
                 localConductionPower += conductionFlux*area;
@@ -1362,7 +1417,7 @@ void Foam::populationDetachedBubbleBirth::updateSources()
             }
             reduce(localBoilingPower, sumOp<scalar>());
             reduce(localConductionPower, sumOp<scalar>());
-            if (partitioned)
+            if (partitioned || inactiveToLiquid)
             {
                 reduce(localLiquidHeatingPower, sumOp<scalar>());
             }
