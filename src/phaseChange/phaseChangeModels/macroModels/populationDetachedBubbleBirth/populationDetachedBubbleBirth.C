@@ -770,11 +770,12 @@ void Foam::populationDetachedBubbleBirth::validateControls() const
         inactiveAreaHeat_ != "none"
      && inactiveAreaHeat_ != "liquid"
      && inactiveAreaHeat_ != "liquidThenNearestSite"
+     && inactiveAreaHeat_ != "liquidThenNearestSiteWithRoom"
     )
     {
         FatalErrorInFunction
-            << "inactiveAreaHeat must be none, liquid or "
-            << "liquidThenNearestSite; found "
+            << "inactiveAreaHeat must be none, liquid, "
+            << "liquidThenNearestSite or liquidThenNearestSiteWithRoom; found "
             << inactiveAreaHeat_
             << exit(FatalError);
     }
@@ -1311,18 +1312,23 @@ void Foam::populationDetachedBubbleBirth::updateSources()
     const bool diagnosticsStep =
         timeIndex % diagnosticsInterval_ == 0 || mesh.time().writeTime();
 
-    // inactiveAreaHeat liquidThenNearestSite: the faces of inactive sites are
-    // handled here, before the site loop, so that the heat their wall-cell
-    // liquid cannot take reaches the nearest active site in this same step.
+    // inactiveAreaHeat liquidThenNearestSite(WithRoom): the faces of inactive
+    // sites are handled here, before the site loop, so that the heat their
+    // wall-cell liquid cannot take reaches an active site in this same step.
     // The law is the same as in the site loop below.
     const label nSites = siteCentres_.size();
+    const bool withRoom = inactiveAreaHeat_ == "liquidThenNearestSiteWithRoom";
     const bool nearestSiteOverflow =
-        boilingClosure && inactiveAreaHeat_ == "liquidThenNearestSite";
+        boilingClosure
+     && (inactiveAreaHeat_ == "liquidThenNearestSite" || withRoom);
     const label nPrepass = nearestSiteOverflow ? nSites : 0;
     boolList prepassActive(nPrepass, false);
     scalarField inactiveLiquidPower(nPrepass, 0.0);
     scalarField inactiveConductionPower(nPrepass, 0.0);
     scalarField receivedPower(nPrepass, 0.0);
+    // Overflow that found no active site with room and went to the nearest
+    // one regardless (liquidThenNearestSiteWithRoom).
+    scalar overflowWithoutRoomPower = 0;
     if (nearestSiteOverflow)
     {
         forAll(siteCentres_, siteI)
@@ -1347,6 +1353,25 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 meanSuperheat + SMALL >= siteActivationSuperheat_[siteI];
         }
 
+        // liquidThenNearestSiteWithRoom: the energy each active site still
+        // lacks for the bubble it is charging, creating or will charge next.
+        // A site that already holds that much has no room, and heat sent to
+        // it would only wait there. The room shrinks as this pass sends heat.
+        // Every processor holds the same site state, so all of them choose
+        // the same targets.
+        scalarField room(withRoom ? nSites : 0, 0.0);
+        forAll(room, siteI)
+        {
+            const scalar need =
+                targetLatentEnergy_[siteI]
+              - (
+                    siteState_[siteI] == CREATING_DETACHED_BUBBLE
+                  ? consumedLatentEnergy_[siteI]
+                  : scalar(0)
+                );
+            room[siteI] = need - boilingEnergy_[siteI] - storedEnergy_[siteI];
+        }
+
         forAll(siteCentres_, siteI)
         {
             if (prepassActive[siteI])
@@ -1354,8 +1379,11 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 continue;
             }
             // Nearest active site in the heater plane; -1 if none is active.
+            // With room: the nearest active site that has room, if any.
             label targetI = -1;
+            label roomTargetI = -1;
             scalar nearestDistanceSqr = GREAT;
+            scalar nearestRoomDistanceSqr = GREAT;
             forAll(siteCentres_, otherI)
             {
                 if (!prepassActive[otherI])
@@ -1368,6 +1396,16 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 {
                     nearestDistanceSqr = distanceSqr;
                     targetI = otherI;
+                }
+                if
+                (
+                    withRoom
+                 && room[otherI] > 0
+                 && distanceSqr < nearestRoomDistanceSqr
+                )
+                {
+                    nearestRoomDistanceSqr = distanceSqr;
+                    roomTargetI = otherI;
                 }
             }
 
@@ -1408,8 +1446,9 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 }
                 else if (targetI >= 0)
                 {
-                    // The liquid is full: the heat funds the bubbles of the
-                    // nearest active site instead.
+                    // The liquid is full: the heat funds the bubbles of an
+                    // active site instead (the nearest, or with room the
+                    // nearest that has room; chosen below).
                     boilingFluxPatch[faceI] = -boilingFlux;
                     overflowPower += boilingFlux*area;
                 }
@@ -1419,6 +1458,18 @@ void Foam::populationDetachedBubbleBirth::updateSources()
             reduce(conductionPower, sumOp<scalar>());
             inactiveLiquidPower[siteI] = liquidPower;
             inactiveConductionPower[siteI] = conductionPower;
+            if (withRoom && overflowPower > 0)
+            {
+                if (roomTargetI >= 0)
+                {
+                    targetI = roomTargetI;
+                    room[targetI] -= overflowPower*deltaT;
+                }
+                else
+                {
+                    overflowWithoutRoomPower += overflowPower;
+                }
+            }
             if (targetI >= 0)
             {
                 receivedPower[targetI] += overflowPower;
@@ -1470,7 +1521,7 @@ void Foam::populationDetachedBubbleBirth::updateSources()
         // law, with all of its heat going to the liquid (inactiveAreaHeat).
         const bool inactiveToLiquid =
             boilingClosure && !siteActive && inactiveAreaHeat_ == "liquid";
-        // liquidThenNearestSite: done before the loop; book it here.
+        // liquidThenNearestSite(WithRoom): done before the loop; book it here.
         const bool inactiveFromPrepass = nearestSiteOverflow && !siteActive;
         const scalar evaporationFraction =
             inactiveToLiquid || inactiveFromPrepass
@@ -1562,8 +1613,8 @@ void Foam::populationDetachedBubbleBirth::updateSources()
             {
                 reduce(localLiquidHeatingPower, sumOp<scalar>());
             }
-            // Heat that the liquid over nearby inactive sites could not take
-            // funds this site's bubbles (liquidThenNearestSite).
+            // Heat that the liquid over inactive sites could not take funds
+            // this site's bubbles (liquidThenNearestSite(WithRoom)).
             if (nearestSiteOverflow)
             {
                 localBoilingPower += receivedPower[siteI];
@@ -2252,8 +2303,12 @@ void Foam::populationDetachedBubbleBirth::updateSources()
                 << " storedBoilingEnergy=" << sum(boilingEnergy_)
                 << " liquidHeatingPower=" << totalLiquidHeatingPower
                 << " cumulativeLiquidHeatingEnergy="
-                << sum(cumulativeLiquidHeatingEnergy_)
-                << endl;
+                << sum(cumulativeLiquidHeatingEnergy_);
+            if (withRoom)
+            {
+                Info<< " overflowWithoutRoomPower=" << overflowWithoutRoomPower;
+            }
+            Info<< endl;
         }
         if (continuitySourceMode_ == "displacedLiquid")
         {

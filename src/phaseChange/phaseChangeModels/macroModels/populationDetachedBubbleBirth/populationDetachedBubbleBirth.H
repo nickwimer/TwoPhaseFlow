@@ -133,6 +133,14 @@ private:
     // the nearest active site (in the heater plane), booked there in the same
     // step. So the whole heater always carries the law while any site is
     // active. These faces are handled in a pass before the site loop.
+    // "liquidThenNearestSiteWithRoom": the same, except that the heat goes to
+    // the nearest active site that still lacks energy for the bubble it is
+    // charging, creating or will charge next. A site's release cycle caps
+    // the heat it can turn into bubbles, and with few, unevenly placed
+    // active sites the nearest one can be funded beyond it, so its stored
+    // energy grows without bound. Only if no active site has room does the
+    // heat go to the nearest one; POPULATION_BOILING_BALANCE then reports
+    // it as overflowWithoutRoomPower.
     word inactiveAreaHeat_;
 
     Switch writeDiagnostics_;
