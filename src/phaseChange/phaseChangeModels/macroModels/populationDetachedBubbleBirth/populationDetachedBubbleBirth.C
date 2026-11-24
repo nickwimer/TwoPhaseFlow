@@ -11,9 +11,12 @@
 #include "PstreamReduceOps.H"
 #include "surfaceFields.H"
 #include "mathematicalConstants.H"
+#include "Time.H"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <sstream>
 
 namespace Foam
 {
@@ -364,7 +367,10 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
             phase1.mesh().time().timeName(),
             phase1.mesh(),
             IOobject::NO_READ,
-            writeDiagnostics_ ? IOobject::AUTO_WRITE : IOobject::NO_WRITE
+            // Always written with the closure: a restart reads it back.
+            writeDiagnostics_ || wallBoilingClosure_ != "none"
+          ? IOobject::AUTO_WRITE
+          : IOobject::NO_WRITE
         ),
         phase1.mesh(),
         dimensionedScalar("zero", dimPower/dimArea, 0.0),
@@ -383,7 +389,8 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
         phase1.mesh(),
         dimensionedScalar("zero", dimPower/dimVol, 0.0),
         "zeroGradient"
-    )
+    ),
+    siteStateWriter_()
 {
     if (energyOwnershipMode_ == "persistentVoronoi")
     {
@@ -422,17 +429,43 @@ Foam::populationDetachedBubbleBirth::populationDetachedBubbleBirth
     cumulativeBoilingBubbleEnergy_.setSize(nSites, 0.0);
     cumulativeLiquidHeatingEnergy_.setSize(nSites, 0.0);
 
-    forAll(nextActivationTime_, siteI)
+    // A run that starts from a time directory with a site state file
+    // continues the sites from it; otherwise every site starts fresh.
+    if (!readSiteState())
     {
-        // Cycle 0 is the wait before a site's first activation; cycle 1 is
-        // its first release (cycleId_ is incremented on activation).
-        nextActivationTime_[siteI] =
-            activationStagger_*siteI + drawWaitingTime(siteI, 0);
-        if (departureDiameterDistribution_ != "fixed")
+        forAll(nextActivationTime_, siteI)
         {
-            buildReleaseStencil(siteI, 0.5*drawDepartureDiameter(siteI, 1));
+            // Cycle 0 is the wait before a site's first activation; cycle 1
+            // is its first release (cycleId_ is incremented on activation).
+            nextActivationTime_[siteI] =
+                activationStagger_*siteI + drawWaitingTime(siteI, 0);
+            if (departureDiameterDistribution_ != "fixed")
+            {
+                buildReleaseStencil
+                (
+                    siteI,
+                    0.5*drawDepartureDiameter(siteI, 1)
+                );
+            }
         }
     }
+
+    siteStateWriter_.reset
+    (
+        new siteStateWriter
+        (
+            IOobject
+            (
+                siteStateName(),
+                phase1.mesh().time().timeName(),
+                "uniform",
+                phase1.mesh(),
+                IOobject::NO_READ,
+                IOobject::AUTO_WRITE
+            ),
+            *this
+        )
+    );
 
     if (Pstream::master())
     {
@@ -1258,6 +1291,336 @@ void Foam::populationDetachedBubbleBirth::resetSite
             0.5*drawDepartureDiameter(siteI, cycleId_[siteI] + 1)
         );
     }
+}
+
+Foam::word Foam::populationDetachedBubbleBirth::siteStateName() const
+{
+    return word(diagnosticPrefix_ + "SiteRestart");
+}
+
+std::string Foam::populationDetachedBubbleBirth::siteStateDigest() const
+{
+    // One line: the count of sites in each state and the sums of the
+    // state's arrays, at full precision. Every value the next step uses is
+    // in one of the sums.
+    std::ostringstream os;
+    os.precision(17);
+    labelList stateCounts(4, label(0));
+    label cycles = 0;
+    label creationSteps = 0;
+    forAll(siteState_, siteI)
+    {
+        if (siteState_[siteI] >= 0 && siteState_[siteI] < 4)
+        {
+            ++stateCounts[siteState_[siteI]];
+        }
+        cycles += cycleId_[siteI];
+        creationSteps += creationStep_[siteI];
+    }
+    os  << "sites=" << siteState_.size()
+        << " waiting=" << stateCounts[WAITING_FOR_ACTIVATION]
+        << " charging=" << stateCounts[CHARGING_DEPARTURE_BUBBLE]
+        << " creating=" << stateCounts[CREATING_DETACHED_BUBBLE]
+        << " clearing=" << stateCounts[WAITING_FOR_CLEARANCE]
+        << " cycles=" << cycles
+        << " creationSteps=" << creationSteps
+        << " storedEnergy=" << sum(storedEnergy_)
+        << " boilingEnergy=" << sum(boilingEnergy_)
+        << " cumulativeBoilingEnergy=" << sum(cumulativeBoilingEnergy_)
+        << " cumulativeBubbleEnergy=" << sum(cumulativeBoilingBubbleEnergy_)
+        << " cumulativeLiquidHeatingEnergy="
+        << sum(cumulativeLiquidHeatingEnergy_)
+        << " consumedLatentEnergy=" << sum(consumedLatentEnergy_)
+        << " createdVaporVolume=" << sum(createdVaporVolume_)
+        << " createdVaporMass=" << sum(createdVaporMass_)
+        << " targetLatentEnergy=" << sum(targetLatentEnergy_)
+        << " targetVaporVolume=" << sum(targetVaporVolume_)
+        << " targetVaporMass=" << sum(targetVaporMass_)
+        << " departureRadius=" << sum(siteDepartureRadius_)
+        << " nextActivationTime=" << sum(nextActivationTime_)
+        << " activationDuration=" << sum(activationDuration_)
+        << " initialSensibleCredit=" << sum(initialSensibleCredit_)
+        << " chargedWallEnergy=" << sum(chargedWallEnergy_)
+        << " displacedLiquidVolume=" << cumulativeDisplacedLiquidVolume_
+        << " birthVaporVolume=" << cumulativeBirthVaporVolume_;
+    // releaseTime_ and creationStartTime_ hold -GREAT for sites that have
+    // not released or started a bubble, which would swamp a sum.
+    scalar releaseTimes = 0;
+    scalar creationStartTimes = 0;
+    forAll(releaseTime_, siteI)
+    {
+        releaseTimes += max(releaseTime_[siteI], scalar(0));
+        creationStartTimes += max(creationStartTime_[siteI], scalar(0));
+    }
+    os  << " releaseTime=" << releaseTimes
+        << " creationStartTime=" << creationStartTimes;
+    return os.str();
+}
+
+bool Foam::populationDetachedBubbleBirth::writeSiteState(Ostream& os) const
+{
+    // At least 17 significant digits, so an ascii file reads back the same
+    // doubles; a binary file is exact anyway.
+    const int oldPrecision = os.precision(std::max(os.precision(), 17));
+
+    const scalar timeValue = phase1_.mesh().time().value();
+    os.writeEntry("time", timeValue);
+    os.writeEntry("siteCount", siteCentres_.size());
+    os.writeEntry("randomSeed", randomSeed_);
+    os.writeEntry
+    (
+        "departureDiameterDistribution",
+        departureDiameterDistribution_
+    );
+    siteCentres_.writeEntry("siteCentres", os);
+
+    const UList<label>& state = siteState_;
+    state.writeEntry("siteState", os);
+    const UList<label>& creationStep = creationStep_;
+    creationStep.writeEntry("creationStep", os);
+    const UList<label>& cycle = cycleId_;
+    cycle.writeEntry("cycleId", os);
+
+    auto scalars = [&os](const char* key, const UList<scalar>& values)
+    {
+        values.writeEntry(key, os);
+    };
+    scalars("activationDuration", activationDuration_);
+    scalars("storedEnergy", storedEnergy_);
+    scalars("releaseTime", releaseTime_);
+    scalars("creationStartTime", creationStartTime_);
+    scalars("initialSensibleCredit", initialSensibleCredit_);
+    scalars("chargedWallEnergy", chargedWallEnergy_);
+    scalars("nextActivationTime", nextActivationTime_);
+    scalars("createdVaporVolume", createdVaporVolume_);
+    scalars("createdVaporMass", createdVaporMass_);
+    scalars("consumedLatentEnergy", consumedLatentEnergy_);
+    scalars("boilingEnergy", boilingEnergy_);
+    scalars("cumulativeBoilingEnergy", cumulativeBoilingEnergy_);
+    scalars("cumulativeBoilingBubbleEnergy", cumulativeBoilingBubbleEnergy_);
+    scalars("cumulativeLiquidHeatingEnergy", cumulativeLiquidHeatingEnergy_);
+    // The current bubble's radius and targets. The targets were summed over
+    // the stencil with the vapor density of the step that built it, so they
+    // are restored as saved rather than rebuilt.
+    scalars("departureRadius", siteDepartureRadius_);
+    scalars("targetVaporVolume", targetVaporVolume_);
+    scalars("targetVaporMass", targetVaporMass_);
+    scalars("targetLatentEnergy", targetLatentEnergy_);
+    os.writeEntry
+    (
+        "cumulativeDisplacedLiquidVolume",
+        cumulativeDisplacedLiquidVolume_
+    );
+    os.writeEntry("cumulativeBirthVaporVolume", cumulativeBirthVaporVolume_);
+
+    os.precision(oldPrecision);
+
+    if (Pstream::master())
+    {
+        std::ostringstream timeText;
+        timeText.precision(17);
+        timeText << timeValue;
+        Info<< "POPULATION_RESTART saved time=" << timeText.str().c_str()
+            << ' ' << siteStateDigest().c_str() << endl;
+    }
+    return os.good();
+}
+
+bool Foam::populationDetachedBubbleBirth::readSiteState()
+{
+    const fvMesh& mesh = phase1_.mesh();
+    const Time& runTime = mesh.time();
+    IOobject io
+    (
+        siteStateName(),
+        runTime.timeName(),
+        "uniform",
+        mesh,
+        IOobject::MUST_READ,
+        IOobject::NO_WRITE,
+        false
+    );
+
+    // Every processor holds a copy. All of them must agree, because
+    // rebuilding the release stencils below ends in global reductions.
+    const bool localFound = io.typeHeaderOk<IOdictionary>(true);
+    const bool anyFound = returnReduce(localFound, orOp<bool>());
+    const bool allFound = returnReduce(localFound, andOp<bool>());
+    if (anyFound != allFound)
+    {
+        FatalErrorInFunction
+            << "The site state " << io.name() << " at time "
+            << runTime.timeName()
+            << " is missing on some processors, so the run cannot continue"
+            << " its sites consistently"
+            << exit(FatalError);
+    }
+    if (!allFound)
+    {
+        Info<< "POPULATION_RESTART none time=" << runTime.timeName()
+            << " file=" << io.name() << ": every site starts fresh" << endl;
+        return false;
+    }
+
+    IOdictionary dict(io);
+    const label nSites = siteCentres_.size();
+
+    const label savedSites = dict.get<label>("siteCount");
+    const label savedSeed = dict.get<label>("randomSeed");
+    const word savedDistribution =
+        dict.get<word>("departureDiameterDistribution");
+    const List<vector> savedCentres(dict.get<List<vector>>("siteCentres"));
+    bool sameCentres = savedCentres.size() == nSites;
+    forAll(savedCentres, siteI)
+    {
+        if (sameCentres && mag(savedCentres[siteI] - siteCentres_[siteI]) > 1e-12)
+        {
+            sameCentres = false;
+        }
+    }
+    if
+    (
+        savedSites != nSites
+     || !sameCentres
+     || savedSeed != randomSeed_
+     || savedDistribution != departureDiameterDistribution_
+    )
+    {
+        FatalIOErrorInFunction(dict)
+            << "The site state in " << io.objectPath()
+            << " belongs to another site population: " << savedSites
+            << " sites, randomSeed " << savedSeed
+            << ", departureDiameterDistribution " << savedDistribution
+            << (sameCentres ? "" : ", different site centres")
+            << "; this run has " << nSites << " sites, randomSeed "
+            << randomSeed_ << ", departureDiameterDistribution "
+            << departureDiameterDistribution_ << nl
+            << "Remove the file to start every site fresh."
+            << exit(FatalIOError);
+    }
+
+    auto labels = [&](const char* key, labelList& values)
+    {
+        labelList saved(dict.get<labelList>(key));
+        if (saved.size() != nSites)
+        {
+            FatalIOErrorInFunction(dict)
+                << key << " has " << saved.size() << " values for "
+                << nSites << " sites" << exit(FatalIOError);
+        }
+        values.transfer(saved);
+    };
+    auto scalars = [&](const char* key, scalarField& values)
+    {
+        const scalarList saved(dict.get<scalarList>(key));
+        if (saved.size() != nSites)
+        {
+            FatalIOErrorInFunction(dict)
+                << key << " has " << saved.size() << " values for "
+                << nSites << " sites" << exit(FatalIOError);
+        }
+        values = saved;
+    };
+
+    labels("siteState", siteState_);
+    labels("creationStep", creationStep_);
+    labels("cycleId", cycleId_);
+    forAll(siteState_, siteI)
+    {
+        if
+        (
+            siteState_[siteI] < WAITING_FOR_ACTIVATION
+         || siteState_[siteI] > WAITING_FOR_CLEARANCE
+        )
+        {
+            FatalIOErrorInFunction(dict)
+                << "Site " << siteI << " has an unknown state "
+                << siteState_[siteI] << exit(FatalIOError);
+        }
+    }
+    scalars("activationDuration", activationDuration_);
+    scalars("storedEnergy", storedEnergy_);
+    scalars("releaseTime", releaseTime_);
+    scalars("creationStartTime", creationStartTime_);
+    scalars("initialSensibleCredit", initialSensibleCredit_);
+    scalars("chargedWallEnergy", chargedWallEnergy_);
+    scalars("nextActivationTime", nextActivationTime_);
+    scalars("createdVaporVolume", createdVaporVolume_);
+    scalars("createdVaporMass", createdVaporMass_);
+    scalars("consumedLatentEnergy", consumedLatentEnergy_);
+    scalars("boilingEnergy", boilingEnergy_);
+    scalars("cumulativeBoilingEnergy", cumulativeBoilingEnergy_);
+    scalars("cumulativeBoilingBubbleEnergy", cumulativeBoilingBubbleEnergy_);
+    scalars("cumulativeLiquidHeatingEnergy", cumulativeLiquidHeatingEnergy_);
+
+    // Rebuild each site's release stencil for the bubble it was charging,
+    // creating or will charge next. buildSiteStencils() built every site for
+    // departureRadius, so only sites with another radius need it. Then put
+    // back the targets as saved.
+    scalarField radius(nSites, 0.0);
+    scalarField savedVolume(nSites, 0.0);
+    scalarField savedMass(nSites, 0.0);
+    scalarField savedLatent(nSites, 0.0);
+    scalars("departureRadius", radius);
+    scalars("targetVaporVolume", savedVolume);
+    scalars("targetVaporMass", savedMass);
+    scalars("targetLatentEnergy", savedLatent);
+    forAll(siteCentres_, siteI)
+    {
+        if (radius[siteI] != siteDepartureRadius_[siteI])
+        {
+            buildReleaseStencil(siteI, radius[siteI]);
+        }
+    }
+    targetVaporVolume_ = savedVolume;
+    targetVaporMass_ = savedMass;
+    targetLatentEnergy_ = savedLatent;
+
+    cumulativeDisplacedLiquidVolume_ =
+        dict.get<scalar>("cumulativeDisplacedLiquidVolume");
+    cumulativeBirthVaporVolume_ = dict.get<scalar>("cumulativeBirthVaporVolume");
+
+    // The heater flux of the last step, which the coupled temperature
+    // boundaries read through qr/qrNbr until this step's update.
+    if (wallBoilingClosure_ != "none")
+    {
+        IOobject fluxIO
+        (
+            wallBoilingFluxFieldName_,
+            runTime.timeName(),
+            mesh,
+            IOobject::MUST_READ,
+            IOobject::NO_WRITE,
+            false
+        );
+        if (returnReduce(fluxIO.typeHeaderOk<volScalarField>(true), andOp<bool>()))
+        {
+            const volScalarField savedFlux(fluxIO, mesh);
+            wallBoilingFlux_.boundaryFieldRef()[patchID_] ==
+                savedFlux.boundaryField()[patchID_];
+        }
+        else
+        {
+            WarningInFunction
+                << "No " << wallBoilingFluxFieldName_ << " at time "
+                << runTime.timeName() << ": the heater flux starts at zero"
+                << " until the first step's update" << endl;
+        }
+    }
+
+    const scalar savedTime = dict.get<scalar>("time");
+    std::ostringstream timeText;
+    timeText.precision(17);
+    timeText << savedTime;
+    Info<< "POPULATION_RESTART restored time=" << timeText.str().c_str()
+        << ' ' << siteStateDigest().c_str() << endl;
+    if (mag(savedTime - runTime.value()) > 1e-9*max(mag(runTime.value()), SMALL))
+    {
+        WarningInFunction
+            << "The site state was saved at time " << savedTime
+            << " but the run starts at " << runTime.value() << endl;
+    }
+    return true;
 }
 
 void Foam::populationDetachedBubbleBirth::updateSources()

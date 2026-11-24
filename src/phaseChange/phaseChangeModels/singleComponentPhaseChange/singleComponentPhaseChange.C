@@ -224,6 +224,34 @@ Foam::singleComponentPhaseChange::singleComponentPhaseChange
         phaseChangeProperties
     );
 
+    // A run continued from a saved time. The alpha equation of each step
+    // uses the alpha source correct() left at the end of the step before, so
+    // the first step of a continued run needs the saved one; without it, any
+    // bubble being created at that time would miss one step of its vapor.
+    // A run from the initial conditions has no saved source and keeps zero.
+    IOobject alphaSourceIO
+    (
+        "alphaSource_",
+        mesh_.time().timeName(),
+        mesh_,
+        IOobject::MUST_READ,
+        IOobject::NO_WRITE,
+        false
+    );
+    if
+    (
+        returnReduce
+        (
+            alphaSourceIO.typeHeaderOk<volScalarField>(true),
+            andOp<bool>()
+        )
+    )
+    {
+        const volScalarField savedAlphaSource(alphaSourceIO, mesh_);
+        alphaSource_ = savedAlphaSource;
+        Info << "phase-change alpha source read from time "
+             << mesh_.time().timeName() << endl;
+    }
 }
 
 // * * * * * * * * * * * * * * * * Destructor  * * * * * * * * * * * * * * * //

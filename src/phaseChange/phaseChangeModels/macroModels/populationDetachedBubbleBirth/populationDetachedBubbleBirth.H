@@ -12,6 +12,10 @@
 #include "Switch.H"
 #include "labelList.H"
 #include "scalarField.H"
+#include "IOdictionary.H"
+#include "autoPtr.H"
+
+#include <string>
 
 namespace Foam
 {
@@ -21,6 +25,43 @@ class populationDetachedBubbleBirth
     public macroModel
 {
 private:
+
+    // Site state as a restart file. The model keeps each site's lifecycle
+    // state, held energy, timers, cycle count and its current bubble's
+    // targets from step to step, and none of that is in the fields. This
+    // object writes it with every time directory, to
+    //     <time>/<region>/uniform/<diagnosticPrefix>SiteRestart
+    // and the model reads it back when a run starts from that time, so the
+    // run continues where it stopped instead of restarting every site. Its
+    // header names it a dictionary, so it is read back as an IOdictionary.
+    class siteStateWriter
+    :
+        public regIOobject
+    {
+        const populationDetachedBubbleBirth& model_;
+
+    public:
+
+        siteStateWriter
+        (
+            const IOobject& io,
+            const populationDetachedBubbleBirth& model
+        )
+        :
+            regIOobject(io),
+            model_(model)
+        {}
+
+        virtual const word& type() const
+        {
+            return IOdictionary::typeName;
+        }
+
+        virtual bool writeData(Ostream& os) const
+        {
+            return model_.writeSiteState(os);
+        }
+    };
 
     word patch_;
     List<vector> siteCentres_;
@@ -208,6 +249,9 @@ private:
     // W/m3. Added to the liquid energy equation with the latent sink.
     volScalarField wallLiquidHeat_;
 
+    // Writes the site state with the fields (see siteStateWriter).
+    autoPtr<siteStateWriter> siteStateWriter_;
+
     enum siteState
     {
         WAITING_FOR_ACTIVATION = 0,
@@ -233,6 +277,14 @@ private:
     const char* stateName(const label state) const;
     void resetSite(const label siteI, const scalar timeValue);
     void updateSources();
+
+    // Site state restart file (siteStateWriter).
+    word siteStateName() const;
+    bool writeSiteState(Ostream& os) const;
+    bool readSiteState();
+    // Sums of the site state at full precision, printed when it is written
+    // and when it is read back, so the two can be compared in the logs.
+    std::string siteStateDigest() const;
 
     populationDetachedBubbleBirth(const populationDetachedBubbleBirth&);
     void operator=(const populationDetachedBubbleBirth&);
